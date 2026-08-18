@@ -7,9 +7,10 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
+#include <DFRobotDFPlayerMini.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.0";
+const String CURRENT_VERSION = "1.1";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -19,6 +20,14 @@ const int motorPin2 = 12;
 const int motorPin3 = 14;
 const int motorPin4 = 27;
 const int hallSensorPin = 26; 
+
+// --- AUDIO (DFPlayer Mini on Serial2) ---
+// ESP32 GPIO 16 (RX2) connects to DFPlayer TX
+// ESP32 GPIO 17 (TX2) connects to DFPlayer RX
+HardwareSerial dfSerial(2);
+DFRobotDFPlayerMini dfPlayer;
+bool dfPlayerReady = false;
+int currentVolume = 20;
 
 // --- MOTOR CONFIGURATION ---
 AccelStepper stepper(AccelStepper::HALF4WIRE, motorPin1, motorPin3, motorPin2, motorPin4);
@@ -52,23 +61,25 @@ const char* htmlPage = R"rawliteral(
     h1 { font-size: 22px; letter-spacing: 2px; margin-bottom: 5px; }
     .card { background: #141414; border: 1px solid #00ff66; border-radius: 8px; padding: 15px; margin: 12px auto; width: 85%; max-width: 400px; box-shadow: 0 0 10px rgba(0,255,102,0.1); }
     .status-val { font-size: 24px; font-weight: bold; color: #ffffff; letter-spacing: 1px; margin-top: 5px; }
-    button { background-color: #222; color: #00ff66; border: 2px solid #00ff66; padding: 12px 20px; font-size: 16px; font-family: monospace; cursor: pointer; border-radius: 6px; margin: 5px; width: 100%; font-weight: bold; }
+    button { background-color: #222; color: #00ff66; border: 2px solid #00ff66; padding: 12px 20px; font-size: 16px; font-family: monospace; cursor: pointer; border-radius: 6px; margin: 5px 0; width: 100%; font-weight: bold; }
     button:active { background-color: #00ff66; color: #000; }
     .btn-exec { background-color: #003311; font-size: 20px; padding: 15px; }
     .btn-pause { background-color: #332200; border-color: #ffaa00; color: #ffaa00; }
     .btn-ota { background-color: #001a33; border-color: #00ccff; color: #00ccff; }
-    input[type="number"] { background: #000; border: 1px solid #00ff66; color: #00ff66; padding: 10px; font-size: 18px; font-family: monospace; text-align: center; width: 60%; border-radius: 4px; margin-bottom: 10px; }
+    .btn-audio-play { background-color: #260026; border-color: #ff00ff; color: #ff00ff; }
+    .btn-audio-stop { background-color: #260000; border-color: #ff3333; color: #ff3333; }
+    input[type="number"], select { background: #000; border: 1px solid #00ff66; color: #00ff66; padding: 10px; font-size: 16px; font-family: monospace; text-align: center; width: 80%; border-radius: 4px; margin-bottom: 10px; box-sizing: border-box; }
     input[type="range"] { width: 90%; margin: 15px 0; accent-color: #00ff66; }
     label { display: block; font-size: 12px; margin-bottom: 5px; color: #88ffbb; letter-spacing: 1px; }
-    .input-row { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 15px; }
+    .input-row { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
     .input-group { flex: 1; }
-    .input-group input { width: 80%; }
+    .input-group input, .input-group select { width: 100%; }
     .ota-status { font-size: 12px; margin-top: 8px; color: #88ffbb; min-height: 16px; }
   </style>
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.1)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -86,6 +97,30 @@ const char* htmlPage = R"rawliteral(
 
   <div class="card">
     <button class="btn-pause" onclick="sendCmd('/togglePause')">PAUSE / RESUME</button>
+  </div>
+
+  <div class="card">
+    <label>AUDIO SYSTEM (DFPLAYER MP3)</label>
+    <div id="audioSdStatus" style="font-size: 11px; color: #88ffbb; margin-bottom: 10px;">QUERYING SD CARD...</div>
+    <div class="input-row">
+      <div class="input-group">
+        <label>DETECTED TRACKS</label>
+        <select id="trackSelect" onchange="syncTrackInput()">
+          <option value="1">Track 1</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>CUSTOM #</label>
+        <input type="number" id="trackInput" min="1" max="999" value="1" onchange="syncTrackSelect()">
+      </div>
+    </div>
+    <button class="btn-audio-play" onclick="playTrack()">PLAY SOUND TRACK</button>
+    <button class="btn-audio-stop" onclick="stopAudio()">STOP SOUND</button>
+    
+    <label style="margin-top: 15px;">AUDIO VOLUME</label>
+    <span style="font-size: 12px; color:#fff;" id="volumeLabel">20 / 30</span>
+    <input type="range" id="volumeSlider" min="0" max="30" step="1" value="20" onchange="submitVolume()">
+    <div id="audioStatus" class="ota-status" style="color: #ff88ff;"></div>
   </div>
 
   <div class="card">
@@ -145,6 +180,72 @@ const char* htmlPage = R"rawliteral(
           console.log(err);
         });
     }
+
+    function playTrack() {
+      let track = document.getElementById('trackInput').value;
+      let statusDiv = document.getElementById('audioStatus');
+      statusDiv.innerText = "SENDING PLAY CMD (TRACK " + track + ")...";
+      fetch('/playTrack?track=' + track)
+        .then(res => res.text())
+        .then(msg => { statusDiv.innerText = msg; })
+        .catch(err => { statusDiv.innerText = "AUDIO CMD FAILED"; console.log(err); });
+    }
+
+    function stopAudio() {
+      let statusDiv = document.getElementById('audioStatus');
+      statusDiv.innerText = "STOPPING AUDIO...";
+      fetch('/stopAudio')
+        .then(res => res.text())
+        .then(msg => { statusDiv.innerText = msg; })
+        .catch(err => { statusDiv.innerText = "STOP CMD FAILED"; console.log(err); });
+    }
+
+    function submitVolume() {
+      let val = document.getElementById('volumeSlider').value;
+      document.getElementById('volumeLabel').innerText = val + " / 30";
+      fetch('/setVolume?val=' + val)
+        .then(res => res.text())
+        .then(msg => { document.getElementById('audioStatus').innerText = msg; })
+        .catch(err => console.log(err));
+    }
+
+    function syncTrackInput() {
+      document.getElementById('trackInput').value = document.getElementById('trackSelect').value;
+    }
+
+    function syncTrackSelect() {
+      let val = document.getElementById('trackInput').value;
+      let sel = document.getElementById('trackSelect');
+      sel.value = val;
+    }
+
+    function loadAudioInfo() {
+      fetch('/getAudioInfo')
+        .then(res => res.json())
+        .then(data => {
+          let sdStatus = document.getElementById('audioSdStatus');
+          let sel = document.getElementById('trackSelect');
+          if (data.trackCount > 0) {
+            sdStatus.innerText = "SD CARD DETECTED (" + data.trackCount + " TRACKS FOUND)";
+            sel.innerHTML = "";
+            for (let i = 1; i <= data.trackCount; i++) {
+              let opt = document.createElement('option');
+              opt.value = i;
+              opt.innerText = "Track " + i;
+              sel.appendChild(opt);
+            }
+          } else {
+            sdStatus.innerText = "SD CARD READY (DIRECT TRACK ACCESS)";
+          }
+          if (data.volume !== undefined) {
+            document.getElementById('volumeSlider').value = data.volume;
+            document.getElementById('volumeLabel').innerText = data.volume + " / 30";
+          }
+        })
+        .catch(err => console.log(err));
+    }
+
+    loadAudioInfo();
 
     setInterval(() => {
       fetch('/status')
@@ -417,6 +518,47 @@ void handleCheckUpdate() {
   }
 }
 
+// --- AUDIO WEB HANDLERS ---
+void handlePlayTrack() {
+  int track = 1;
+  if (server.hasArg("track")) {
+    track = server.arg("track").toInt();
+  }
+  if (track < 1) track = 1;
+  dfPlayer.play(track);
+  Serial.printf("[AUDIO] Playing Track %d\n", track);
+  server.send(200, "text/plain", "PLAYING TRACK " + String(track));
+}
+
+void handleStopAudio() {
+  dfPlayer.stop();
+  Serial.println("[AUDIO] Audio playback stopped.");
+  server.send(200, "text/plain", "AUDIO STOPPED");
+}
+
+void handleSetVolume() {
+  if (server.hasArg("val")) {
+    currentVolume = server.arg("val").toInt();
+    currentVolume = constrain(currentVolume, 0, 30);
+    dfPlayer.volume(currentVolume);
+    Serial.printf("[AUDIO] Volume set to %d/30\n", currentVolume);
+    server.send(200, "text/plain", "VOLUME: " + String(currentVolume) + "/30");
+  } else {
+    server.send(400, "text/plain", "Missing Parameter");
+  }
+}
+
+void handleGetAudioInfo() {
+  int count = dfPlayer.readFileCounts();
+  if (count < 0) count = 0;
+  String json = "{";
+  json += "\"ready\":" + String(dfPlayerReady ? "true" : "false") + ",";
+  json += "\"trackCount\":" + String(count) + ",";
+  json += "\"volume\":" + String(currentVolume);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -427,6 +569,16 @@ void setup() {
   stepper.setAcceleration(400);
 
   findHome();
+
+  // --- AUDIO INITIALIZATION (DFPlayer Mini) ---
+  dfSerial.begin(9600, SERIAL_8N1, 16, 17);
+  if (dfPlayer.begin(dfSerial, false, false)) {
+    dfPlayerReady = true;
+    dfPlayer.volume(currentVolume);
+    Serial.println("[AUDIO] DFPlayer Mini initialized on Serial2 (RX=16, TX=17).");
+  } else {
+    Serial.println("[AUDIO] DFPlayer Mini offline or not responding (will accept commands).");
+  }
 
   // --- CAPTIVE PORTAL / WI-FI PROVISIONING ---
   WiFiManager wm;
@@ -449,6 +601,10 @@ void setup() {
   server.on("/setFlap", HTTP_GET, handleSetFlap);
   server.on("/setSpeed", HTTP_GET, handleSetSpeed); 
   server.on("/check-update", HTTP_GET, handleCheckUpdate);
+  server.on("/playTrack", HTTP_GET, handlePlayTrack);
+  server.on("/stopAudio", HTTP_GET, handleStopAudio);
+  server.on("/setVolume", HTTP_GET, handleSetVolume);
+  server.on("/getAudioInfo", HTTP_GET, handleGetAudioInfo);
   server.begin();
   
   Wire.begin(21, 22);
