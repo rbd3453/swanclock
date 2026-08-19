@@ -10,7 +10,7 @@
 #include <DFRobotDFPlayerMini.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.1";
+const String CURRENT_VERSION = "1.2";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -20,6 +20,13 @@ const int motorPin2 = 12;
 const int motorPin3 = 14;
 const int motorPin4 = 27;
 const int hallSensorPin = 26; 
+
+// --- VOLUME POTENTIOMETER ---
+// Pin 1 ➔ 3.3V | Pin 3 ➔ GND | Pin 2 (Signal Wiper) ➔ GPIO 34
+const int potPin = 34;
+int lastPotVolume = -1;
+unsigned long lastPotReadMillis = 0;
+const unsigned long potReadInterval = 100; // Check ADC every 100ms
 
 // --- AUDIO (DFPlayer Mini on Serial2) ---
 // ESP32 GPIO 16 (RX2) connects to DFPlayer TX
@@ -79,7 +86,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.1)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.2)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -540,6 +547,7 @@ void handleSetVolume() {
   if (server.hasArg("val")) {
     currentVolume = server.arg("val").toInt();
     currentVolume = constrain(currentVolume, 0, 30);
+    lastPotVolume = currentVolume;
     dfPlayer.volume(currentVolume);
     Serial.printf("[AUDIO] Volume set to %d/30\n", currentVolume);
     server.send(200, "text/plain", "VOLUME: " + String(currentVolume) + "/30");
@@ -565,6 +573,13 @@ void setup() {
   Serial.println("\n=== SWAN STATION MASTER BRAIN INITIALIZING ===");
 
   pinMode(hallSensorPin, INPUT_PULLUP);
+  pinMode(potPin, INPUT);
+
+  // Read initial potentiometer level
+  int initialPot = analogRead(potPin);
+  currentVolume = constrain(map(initialPot, 20, 4070, 0, 30), 0, 30);
+  lastPotVolume = currentVolume;
+
   stepper.setMaxSpeed(800);
   stepper.setAcceleration(400);
 
@@ -575,7 +590,7 @@ void setup() {
   if (dfPlayer.begin(dfSerial, false, false)) {
     dfPlayerReady = true;
     dfPlayer.volume(currentVolume);
-    Serial.println("[AUDIO] DFPlayer Mini initialized on Serial2 (RX=16, TX=17).");
+    Serial.printf("[AUDIO] DFPlayer Mini initialized. Volume: %d/30 (Pot ADC: %d)\n", currentVolume, initialPot);
   } else {
     Serial.println("[AUDIO] DFPlayer Mini offline or not responding (will accept commands).");
   }
@@ -617,6 +632,20 @@ void loop() {
   stepper.run(); 
 
   unsigned long currentMillis = millis();
+
+  // --- NON-BLOCKING POTENTIOMETER READ ---
+  if (currentMillis - lastPotReadMillis >= potReadInterval) {
+    lastPotReadMillis = currentMillis;
+    int rawPot = analogRead(potPin);
+    int mappedVol = constrain(map(rawPot, 20, 4070, 0, 30), 0, 30);
+    if (mappedVol != lastPotVolume) {
+      lastPotVolume = mappedVol;
+      currentVolume = mappedVol;
+      dfPlayer.volume(currentVolume);
+      Serial.printf("[AUDIO] Volume Dial: %d/30 (ADC: %d)\n", currentVolume, rawPot);
+    }
+  }
+
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
