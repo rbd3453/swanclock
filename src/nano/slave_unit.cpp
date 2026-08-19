@@ -222,24 +222,6 @@ void setup() {
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
-
-  // Sleep routine if idle
-  if (currentMillis - previousSleepMillis >= WAIT_TIME && currentlyrotating == 0 && displayedLetter == desiredLetter) {
-    byte old_ADCSRA = ADCSRA;
-    ADCSRA = 0; // Disable ADC for power saving
-    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-    sleep_enable();
-    sleep_cpu();
-    sleep_disable();
-    previousSleepMillis = millis();
-    ADCSRA = old_ADCSRA;
-
-    // Restore I2C TWI bus after wake-up
-    TWCR = bit(TWEN) | bit(TWIE) | bit(TWEA) | bit(TWINT);
-    Wire.begin(i2cAddress);
-  }
-
   // Check if a new letter index was received over I2C
   if (displayedLetter != desiredLetter) {
     rotateToLetter(desiredLetter);

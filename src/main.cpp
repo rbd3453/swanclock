@@ -12,7 +12,7 @@
 #include <freertos/task.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.3.4";
+const String CURRENT_VERSION = "1.3.5";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -106,7 +106,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.4)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.5)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -172,6 +172,25 @@ const char* htmlPage = R"rawliteral(
   </div>
 
   <div class="card">
+    <label>I2C BUS DIAGNOSTICS & SLAVE SCANNER</label>
+    <button class="btn-ota" id="btnScanI2C" onclick="runI2CScan()">SCAN I2C BUS (0x01 - 0x77)</button>
+    <pre id="i2cScanResults" class="console-box" style="height: 90px; color: #88ffbb; border-color: #00ff66;">[SYSTEM] Ready to scan I2C bus.</pre>
+    
+    <div class="input-row" style="margin-top: 10px;">
+      <div class="input-group">
+        <label>TEST SLAVE ADDR</label>
+        <input type="number" id="testSlaveAddr" min="1" max="127" value="1">
+      </div>
+      <div class="input-group">
+        <label>TEST FLAP (0-44)</label>
+        <input type="number" id="testSlaveFlap" min="0" max="44" value="1">
+      </div>
+    </div>
+    <button onclick="testSlaveDrum()">SEND SINGLE TEST FLAP</button>
+    <div id="testSlaveStatus" class="ota-status" style="color: #ff88ff;"></div>
+  </div>
+
+  <div class="card">
     <label>FIRMWARE MANAGEMENT & OTA TERMINAL</label>
     <button class="btn-ota" id="btnOta" onclick="checkUpdate()">CHECK FOR FIRMWARE UPDATES</button>
     
@@ -202,6 +221,30 @@ const char* htmlPage = R"rawliteral(
       let val = document.getElementById('speedSlider').value;
       document.getElementById('speedLabel').innerText = val + " Steps/Sec";
       fetch('/setSpeed?val=' + val).catch(err => console.log(err));
+    }
+
+    function runI2CScan() {
+      let resEl = document.getElementById('i2cScanResults');
+      resEl.innerText = "[I2C] Scanning bus addresses 0x01 to 0x77...";
+      fetch('/scanI2C')
+        .then(res => res.json())
+        .then(data => {
+          resEl.innerText = data.logs;
+        })
+        .catch(err => {
+          resEl.innerText = "[ERROR] I2C Scan request failed: " + err;
+        });
+    }
+
+    function testSlaveDrum() {
+      let addr = document.getElementById('testSlaveAddr').value;
+      let flap = document.getElementById('testSlaveFlap').value;
+      let statusEl = document.getElementById('testSlaveStatus');
+      statusEl.innerText = "Sending to Slave 0x" + Number(addr).toString(16).toUpperCase() + "...";
+      fetch('/testSlave?addr=' + addr + '&flap=' + flap)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
     }
 
     let otaPollInterval = null;
@@ -719,6 +762,68 @@ void handleGetAudioInfo() {
   server.send(200, "application/json", json);
 }
 
+void handleScanI2C() {
+  String logOutput = "=== I2C BUS SCAN (GPIO 21 SDA, GPIO 22 SCL) ===\n";
+  int count = 0;
+  
+  Wire.setTimeOut(15);
+  Wire.setClock(100000);
+
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission(true);
+
+    if (error == 0) {
+      logOutput += "[SUCCESS] Device found at 0x" + (address < 16 ? String("0") : String("")) + String(address, HEX) + " (Decimal " + String(address) + ")\n";
+      count++;
+    } else if (error == 4) {
+      logOutput += "[ERROR] Unknown I2C error at address 0x" + String(address, HEX) + "\n";
+    }
+  }
+
+  if (count == 0) {
+    logOutput += "[RESULT] No I2C devices detected.\n";
+    logOutput += "Check: Common Ground, 3.3V/5V Level Shifter power, and A4/A5 wiring.";
+  } else {
+    logOutput += "[RESULT] Scan complete: " + String(count) + " device(s) responded!";
+  }
+
+  String json = "{";
+  json += "\"count\":" + String(count) + ",";
+  String escapedLogs = logOutput;
+  escapedLogs.replace("\\", "\\\\");
+  escapedLogs.replace("\"", "\\\"");
+  escapedLogs.replace("\n", "\\n");
+  escapedLogs.replace("\r", "");
+  json += "\"logs\":\"" + escapedLogs + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleTestSlave() {
+  if (server.hasArg("addr") && server.hasArg("flap")) {
+    uint8_t addr = server.arg("addr").toInt();
+    uint8_t flap = server.arg("flap").toInt();
+    
+    Wire.setTimeOut(20);
+    Wire.beginTransmission(addr);
+    Wire.write(flap);
+    Wire.write((uint8_t)10); // Speed RPM
+    uint8_t error = Wire.endTransmission(true);
+
+    if (error == 0) {
+      server.send(200, "text/plain", "SUCCESS: Slave 0x" + String(addr, HEX) + " ACKed Flap " + String(flap));
+    } else if (error == 2) {
+      server.send(200, "text/plain", "NACK: No response from Slave Address 0x" + String(addr, HEX));
+    } else {
+      server.send(200, "text/plain", "I2C Error code " + String(error) + " on Address 0x" + String(addr, HEX));
+    }
+  } else {
+    server.send(400, "text/plain", "Missing Parameter");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -768,6 +873,8 @@ void setup() {
   server.on("/togglePause", HTTP_GET, handleTogglePause);
   server.on("/setFlap", HTTP_GET, handleSetFlap);
   server.on("/setSpeed", HTTP_GET, handleSetSpeed); 
+  server.on("/scanI2C", HTTP_GET, handleScanI2C);
+  server.on("/testSlave", HTTP_GET, handleTestSlave);
   server.on("/check-update", HTTP_GET, handleCheckUpdate);
   server.on("/ota-status", HTTP_GET, handleOtaStatus);
   server.on("/playTrack", HTTP_GET, handlePlayTrack);
