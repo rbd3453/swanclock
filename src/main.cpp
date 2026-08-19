@@ -12,7 +12,7 @@
 #include <freertos/task.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.3.1";
+const String CURRENT_VERSION = "1.3.2";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -106,7 +106,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.1)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.2)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -160,6 +160,18 @@ const char* htmlPage = R"rawliteral(
     <label>DEBUG OVERRIDE: TARGET & ROTATIONS</label>
     <div class="input-row">
       <div class="input-group">
+        <label>TARGET DRUM</label>
+        <select id="unitSelect">
+          <option value="0">Master (Digit 1 - Hundreds)</option>
+          <option value="1">Slave 1 (Digit 2 - Tens Min)</option>
+          <option value="2">Slave 2 (Digit 3 - Ones Min)</option>
+          <option value="3">Slave 3 (Digit 4 - Tens Sec)</option>
+          <option value="4">Slave 4 (Digit 5 - Ones Sec)</option>
+        </select>
+      </div>
+    </div>
+    <div class="input-row">
+      <div class="input-group">
         <label>TARGET FLAP (0-44)</label>
         <input type="number" id="flapInput" min="0" max="44" value="1">
       </div>
@@ -195,7 +207,8 @@ const char* htmlPage = R"rawliteral(
     function submitFlap() {
       let val = document.getElementById('flapInput').value;
       let rot = document.getElementById('rotationsInput').value;
-      fetch('/setFlap?val=' + val + '&rot=' + rot).catch(err => console.log(err));
+      let unit = document.getElementById('unitSelect').value;
+      fetch('/setFlap?val=' + val + '&rot=' + rot + '&unit=' + unit).catch(err => console.log(err));
     }
 
     function submitSpeed() {
@@ -365,8 +378,52 @@ const char* htmlPage = R"rawliteral(
 </html>
 )rawliteral";
 
+// Forward declarations
+void goToFlap(int targetFlap, int extraRotations = 0);
+
+// --- I2C SLAVE BROADCAST HELPERS ---
+void sendSlaveFlap(uint8_t slaveAddress, uint8_t flapIndex, uint8_t speedRPM = 10) {
+  Wire.beginTransmission(slaveAddress);
+  Wire.write(flapIndex);
+  Wire.write(speedRPM);
+  Wire.endTransmission();
+}
+
+// Convert 0-9 digit to standard Split-Flap character index (30 = '0' ... 39 = '9')
+uint8_t digitToFlap(int digit) {
+  if (digit >= 0 && digit <= 9) {
+    return 30 + digit;
+  }
+  return 0; // Blank / Space
+}
+
+void updateAllDrums(int minutes, int seconds) {
+  // Digit 1 (Master Local ESP32 Drum): Hundreds of minutes (Flap 1='1', Flap 0=' ')
+  if (minutes >= 100) {
+    goToFlap(1);
+  } else {
+    goToFlap(0);
+  }
+
+  // Digit 2 (Slave 1 @ 0x01): Tens of Minutes (0-9)
+  int tensMinutes = (minutes % 100) / 10;
+  sendSlaveFlap(1, digitToFlap(tensMinutes));
+
+  // Digit 3 (Slave 2 @ 0x02): Ones of Minutes (0-9)
+  int onesMinutes = minutes % 10;
+  sendSlaveFlap(2, digitToFlap(onesMinutes));
+
+  // Digit 4 (Slave 3 @ 0x03): Tens of Seconds (0-5)
+  int tensSeconds = seconds / 10;
+  sendSlaveFlap(3, digitToFlap(tensSeconds));
+
+  // Digit 5 (Slave 4 @ 0x04): Ones of Seconds (0-9)
+  int onesSeconds = seconds % 10;
+  sendSlaveFlap(4, digitToFlap(onesSeconds));
+}
+
 // --- DRIFT-FREE FLAP MATH WITH EXTRA ROTATIONS ---
-void goToFlap(int targetFlap, int extraRotations = 0) {
+void goToFlap(int targetFlap, int extraRotations) {
   if (targetFlap < 0 || targetFlap >= TOTAL_FLAPS) return;
   
   // If we are already there AND no extra rotations are requested, do nothing
@@ -604,8 +661,15 @@ void handleExecute() {
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
   
-  // Have it do 2 dramatic extra full spins when reset, just like the show!
+  // Have master do 2 dramatic extra full spins when reset, just like the show!
   goToFlap(1, 2); 
+  
+  // Reset slave drums to 0, 8, 0, 0
+  sendSlaveFlap(1, digitToFlap(0));
+  sendSlaveFlap(2, digitToFlap(8));
+  sendSlaveFlap(3, digitToFlap(0));
+  sendSlaveFlap(4, digitToFlap(0));
+
   server.send(200, "text/plain", "OK");
 }
 
@@ -619,16 +683,25 @@ void handleSetFlap() {
   if (server.hasArg("val")) {
     int target = server.arg("val").toInt();
     int rot = 0;
+    int unit = 0;
     
-    // Check if the secondary extra rotations parameter was passed
+    // Check if extra rotations parameter was passed
     if (server.hasArg("rot")) {
       rot = server.arg("rot").toInt();
     }
+    // Check if target drum unit was passed (0 = master, 1..4 = slave)
+    if (server.hasArg("unit")) {
+      unit = server.arg("unit").toInt();
+    }
     
     isPaused = true; 
-    Serial.printf("[DEBUG] Manual override: Moving to Flap %d with %d Extra Rotations\n", target, rot);
+    Serial.printf("[DEBUG] Manual override: Moving Drum %d to Flap %d (extra rot: %d)\n", unit, target, rot);
     
-    goToFlap(target, rot);
+    if (unit == 0) {
+      goToFlap(target, rot);
+    } else {
+      sendSlaveFlap((uint8_t)unit, (uint8_t)target);
+    }
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Missing Parameter");
@@ -777,8 +850,9 @@ void setup() {
   server.begin();
   
   Wire.begin(21, 22);
+  Wire.setClock(100000); // 100kHz standard I2C clock speed for reliable slave response
 
-  goToFlap(1);
+  updateAllDrums(currentMinutes, currentSeconds);
 }
 
 void loop() {
@@ -804,16 +878,13 @@ void loop() {
     previousMillis = currentMillis;
 
     if (!isPaused) {
-      if (currentMinutes >= 100) {
-        goToFlap(1); 
-      } else if (currentMinutes > 0) {
-        goToFlap(40); 
-      } else if (currentMinutes == 0 && currentSeconds == 0) {
-        goToFlap(41); 
-      }
-
       if (currentMinutes == 0 && currentSeconds == 0) {
-        // Hold at zero
+        // Hold at zero / alert state
+        goToFlap(41); 
+        sendSlaveFlap(1, 41);
+        sendSlaveFlap(2, 41);
+        sendSlaveFlap(3, 41);
+        sendSlaveFlap(4, 41);
       } else {
         if (currentSeconds == 0) {
           currentMinutes--;
@@ -821,6 +892,7 @@ void loop() {
         } else {
           currentSeconds--;
         }
+        updateAllDrums(currentMinutes, currentSeconds);
       }
     }
   }
