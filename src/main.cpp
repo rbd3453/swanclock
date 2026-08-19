@@ -12,7 +12,7 @@
 #include <freertos/task.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.3";
+const String CURRENT_VERSION = "1.3.1";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -28,7 +28,7 @@ const int hallSensorPin = 26;
 const int potPin = 34;
 int lastPotVolume = -1;
 unsigned long lastPotReadMillis = 0;
-const unsigned long potReadInterval = 100; // Check ADC every 100ms
+const unsigned long potReadInterval = 50; // Check ADC every 50ms for responsive dial tracking
 
 // --- AUDIO (DFPlayer Mini on Serial2) ---
 // ESP32 GPIO 16 (RX2) connects to DFPlayer TX
@@ -93,7 +93,7 @@ const char* htmlPage = R"rawliteral(
     .btn-audio-play { background-color: #260026; border-color: #ff00ff; color: #ff00ff; }
     .btn-audio-stop { background-color: #260000; border-color: #ff3333; color: #ff3333; }
     input[type="number"], select { background: #000; border: 1px solid #00ff66; color: #00ff66; padding: 10px; font-size: 16px; font-family: monospace; text-align: center; width: 80%; border-radius: 4px; margin-bottom: 10px; box-sizing: border-box; }
-    input[type="range"] { width: 90%; margin: 15px 0; accent-color: #00ff66; }
+    input[type="range"] { width: 90%; margin: 15px 0; accent-color: #00ff66; cursor: pointer; }
     label { display: block; font-size: 12px; margin-bottom: 5px; color: #88ffbb; letter-spacing: 1px; }
     .input-row { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
     .input-group { flex: 1; }
@@ -106,7 +106,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.1)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -144,9 +144,9 @@ const char* htmlPage = R"rawliteral(
     <button class="btn-audio-play" onclick="playTrack()">PLAY SOUND TRACK</button>
     <button class="btn-audio-stop" onclick="stopAudio()">STOP SOUND</button>
     
-    <label style="margin-top: 15px;">AUDIO VOLUME</label>
+    <label style="margin-top: 15px;">AUDIO VOLUME (LIVE DIAL SYNC)</label>
     <span style="font-size: 12px; color:#fff;" id="volumeLabel">20 / 30</span>
-    <input type="range" id="volumeSlider" min="0" max="30" step="1" value="20" onchange="submitVolume()">
+    <input type="range" id="volumeSlider" min="0" max="30" step="1" value="20" oninput="onSliderInput()" onchange="submitVolume()">
     <div id="audioStatus" class="ota-status" style="color: #ff88ff;"></div>
   </div>
 
@@ -278,13 +278,27 @@ const char* htmlPage = R"rawliteral(
         .catch(err => { statusDiv.innerText = "STOP CMD FAILED"; console.log(err); });
     }
 
+    let isUserInteractingSlider = false;
+
+    function onSliderInput() {
+      isUserInteractingSlider = true;
+      let val = document.getElementById('volumeSlider').value;
+      document.getElementById('volumeLabel').innerText = val + " / 30";
+    }
+
     function submitVolume() {
       let val = document.getElementById('volumeSlider').value;
       document.getElementById('volumeLabel').innerText = val + " / 30";
       fetch('/setVolume?val=' + val)
         .then(res => res.text())
-        .then(msg => { document.getElementById('audioStatus').innerText = msg; })
-        .catch(err => console.log(err));
+        .then(msg => { 
+          document.getElementById('audioStatus').innerText = msg; 
+          setTimeout(() => { isUserInteractingSlider = false; }, 300);
+        })
+        .catch(err => {
+          console.log(err);
+          isUserInteractingSlider = false;
+        });
     }
 
     function syncTrackInput() {
@@ -315,7 +329,7 @@ const char* htmlPage = R"rawliteral(
           } else {
             sdStatus.innerText = "SD CARD READY (DIRECT TRACK ACCESS)";
           }
-          if (data.volume !== undefined) {
+          if (data.volume !== undefined && !isUserInteractingSlider) {
             document.getElementById('volumeSlider').value = data.volume;
             document.getElementById('volumeLabel').innerText = data.volume + " / 30";
           }
@@ -323,18 +337,29 @@ const char* htmlPage = R"rawliteral(
         .catch(err => console.log(err));
     }
 
+    let sliderEl = document.getElementById('volumeSlider');
+    sliderEl.addEventListener('mousedown', () => { isUserInteractingSlider = true; });
+    sliderEl.addEventListener('touchstart', () => { isUserInteractingSlider = true; });
+    sliderEl.addEventListener('mouseup', () => { isUserInteractingSlider = false; });
+    sliderEl.addEventListener('touchend', () => { isUserInteractingSlider = false; });
+
     loadAudioInfo();
     pollOtaStatus();
 
+    // Fast 200ms status poll for live volume knob & countdown tracking
     setInterval(() => {
       fetch('/status')
         .then(res => res.json())
         .then(data => {
           document.getElementById('timerDisplay').innerText = data.timer;
           document.getElementById('flapDisplay').innerText = "FLAP " + data.flap;
+          if (data.volume !== undefined && !isUserInteractingSlider) {
+            document.getElementById('volumeSlider').value = data.volume;
+            document.getElementById('volumeLabel').innerText = data.volume + " / 30";
+          }
         })
         .catch(err => console.log(err));
-    }, 500);
+    }, 200);
   </script>
 </body>
 </html>
@@ -385,14 +410,21 @@ void findHome() {
   Serial.println("\n[SUCCESS] HOME LOCKED. INDEXED TO FLAP 8.");
 }
 
-// --- VERSION COMPARISON HELPER ---
+// --- VERSION COMPARISON HELPER (SEMANTIC MAJOR.MINOR.PATCH) ---
 bool isNewerVersion(const String& serverVer, const String& currentVer) {
-  float serverFloat = serverVer.toFloat();
-  float currentFloat = currentVer.toFloat();
-  if (serverFloat > 0 && currentFloat > 0) {
-    return serverFloat > currentFloat;
-  }
-  return (serverVer != currentVer) && (serverVer.length() > 0);
+  if (serverVer == currentVer || serverVer.length() == 0) return false;
+  
+  int sMajor = 0, sMinor = 0, sPatch = 0;
+  int cMajor = 0, cMinor = 0, cPatch = 0;
+  
+  sscanf(serverVer.c_str(), "%d.%d.%d", &sMajor, &sMinor, &sPatch);
+  sscanf(currentVer.c_str(), "%d.%d.%d", &cMajor, &cMinor, &cPatch);
+  
+  if (sMajor != cMajor) return sMajor > cMajor;
+  if (sMinor != cMinor) return sMinor > cMinor;
+  if (sPatch != cPatch) return sPatch > cPatch;
+  
+  return false;
 }
 
 // --- BACKGROUND ASYNCHRONOUS OTA TASK ---
@@ -558,7 +590,8 @@ void handleStatus() {
 
   String json = "{";
   json += "\"timer\":\"" + String(timerBuf) + "\",";
-  json += "\"flap\":" + String(currentFlapPosition);
+  json += "\"flap\":" + String(currentFlapPosition) + ",";
+  json += "\"volume\":" + String(currentVolume);
   json += "}";
 
   server.send(200, "application/json", json);
@@ -693,10 +726,11 @@ void setup() {
 
   pinMode(hallSensorPin, INPUT_PULLUP);
   pinMode(potPin, INPUT);
+  analogSetPinAttenuation(potPin, ADC_11db);
 
   // Read initial potentiometer level
   int initialPot = analogRead(potPin);
-  currentVolume = constrain(map(initialPot, 20, 4070, 0, 30), 0, 30);
+  currentVolume = constrain(map(initialPot, 15, 4080, 0, 30), 0, 30);
   lastPotVolume = currentVolume;
 
   stepper.setMaxSpeed(800);
@@ -757,7 +791,7 @@ void loop() {
   if (currentMillis - lastPotReadMillis >= potReadInterval) {
     lastPotReadMillis = currentMillis;
     int rawPot = analogRead(potPin);
-    int mappedVol = constrain(map(rawPot, 20, 4070, 0, 30), 0, 30);
+    int mappedVol = constrain(map(rawPot, 15, 4080, 0, 30), 0, 30);
     if (mappedVol != lastPotVolume) {
       lastPotVolume = mappedVol;
       currentVolume = mappedVol;
