@@ -12,7 +12,7 @@
 #include <freertos/task.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.3.2";
+const String CURRENT_VERSION = "1.3.3";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -106,7 +106,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.2)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.3)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -382,11 +382,24 @@ const char* htmlPage = R"rawliteral(
 void goToFlap(int targetFlap, int extraRotations = 0);
 
 // --- I2C SLAVE BROADCAST HELPERS ---
-void sendSlaveFlap(uint8_t slaveAddress, uint8_t flapIndex, uint8_t speedRPM = 10) {
+// Cache last sent flap positions for slave units 1..4 so we never send redundant I2C frames
+int lastSentSlaveFlap[5] = { -1, -1, -1, -1, -1 };
+
+void sendSlaveFlap(uint8_t slaveAddress, uint8_t flapIndex, uint8_t speedRPM = 10, bool force = false) {
+  if (slaveAddress < 1 || slaveAddress > 4) return;
+  
+  // Skip I2C transmission if slave is already displaying this flap and force is false
+  if (!force && lastSentSlaveFlap[slaveAddress] == (int)flapIndex) {
+    return;
+  }
+
   Wire.beginTransmission(slaveAddress);
   Wire.write(flapIndex);
   Wire.write(speedRPM);
-  Wire.endTransmission();
+  uint8_t err = Wire.endTransmission(true);
+  if (err == 0) {
+    lastSentSlaveFlap[slaveAddress] = (int)flapIndex;
+  }
 }
 
 // Convert 0-9 digit to standard Split-Flap character index (30 = '0' ... 39 = '9')
@@ -397,7 +410,7 @@ uint8_t digitToFlap(int digit) {
   return 0; // Blank / Space
 }
 
-void updateAllDrums(int minutes, int seconds) {
+void updateAllDrums(int minutes, int seconds, bool force = false) {
   // Digit 1 (Master Local ESP32 Drum): Hundreds of minutes (Flap 1='1', Flap 0=' ')
   if (minutes >= 100) {
     goToFlap(1);
@@ -407,19 +420,19 @@ void updateAllDrums(int minutes, int seconds) {
 
   // Digit 2 (Slave 1 @ 0x01): Tens of Minutes (0-9)
   int tensMinutes = (minutes % 100) / 10;
-  sendSlaveFlap(1, digitToFlap(tensMinutes));
+  sendSlaveFlap(1, digitToFlap(tensMinutes), 10, force);
 
   // Digit 3 (Slave 2 @ 0x02): Ones of Minutes (0-9)
   int onesMinutes = minutes % 10;
-  sendSlaveFlap(2, digitToFlap(onesMinutes));
+  sendSlaveFlap(2, digitToFlap(onesMinutes), 10, force);
 
   // Digit 4 (Slave 3 @ 0x03): Tens of Seconds (0-5)
   int tensSeconds = seconds / 10;
-  sendSlaveFlap(3, digitToFlap(tensSeconds));
+  sendSlaveFlap(3, digitToFlap(tensSeconds), 10, force);
 
   // Digit 5 (Slave 4 @ 0x04): Ones of Seconds (0-9)
   int onesSeconds = seconds % 10;
-  sendSlaveFlap(4, digitToFlap(onesSeconds));
+  sendSlaveFlap(4, digitToFlap(onesSeconds), 10, force);
 }
 
 // --- DRIFT-FREE FLAP MATH WITH EXTRA ROTATIONS ---
@@ -664,11 +677,8 @@ void handleExecute() {
   // Have master do 2 dramatic extra full spins when reset, just like the show!
   goToFlap(1, 2); 
   
-  // Reset slave drums to 0, 8, 0, 0
-  sendSlaveFlap(1, digitToFlap(0));
-  sendSlaveFlap(2, digitToFlap(8));
-  sendSlaveFlap(3, digitToFlap(0));
-  sendSlaveFlap(4, digitToFlap(0));
+  // Reset slave drums with force=true
+  updateAllDrums(currentMinutes, currentSeconds, true);
 
   server.send(200, "text/plain", "OK");
 }
@@ -700,7 +710,7 @@ void handleSetFlap() {
     if (unit == 0) {
       goToFlap(target, rot);
     } else {
-      sendSlaveFlap((uint8_t)unit, (uint8_t)target);
+      sendSlaveFlap((uint8_t)unit, (uint8_t)target, 10, true);
     }
     server.send(200, "text/plain", "OK");
   } else {
@@ -850,9 +860,10 @@ void setup() {
   server.begin();
   
   Wire.begin(21, 22);
-  Wire.setClock(100000); // 100kHz standard I2C clock speed for reliable slave response
+  Wire.setTimeOut(10);   // Crucial: 10ms timeout prevents blocking when slaves are offline or waking up
+  Wire.setClock(100000); // 100kHz standard I2C clock speed
 
-  updateAllDrums(currentMinutes, currentSeconds);
+  updateAllDrums(currentMinutes, currentSeconds, true);
 }
 
 void loop() {
@@ -881,10 +892,10 @@ void loop() {
       if (currentMinutes == 0 && currentSeconds == 0) {
         // Hold at zero / alert state
         goToFlap(41); 
-        sendSlaveFlap(1, 41);
-        sendSlaveFlap(2, 41);
-        sendSlaveFlap(3, 41);
-        sendSlaveFlap(4, 41);
+        sendSlaveFlap(1, 41, 10, true);
+        sendSlaveFlap(2, 41, 10, true);
+        sendSlaveFlap(3, 41, 10, true);
+        sendSlaveFlap(4, 41, 10, true);
       } else {
         if (currentSeconds == 0) {
           currentMinutes--;
@@ -892,7 +903,7 @@ void loop() {
         } else {
           currentSeconds--;
         }
-        updateAllDrums(currentMinutes, currentSeconds);
+        updateAllDrums(currentMinutes, currentSeconds, false);
       }
     }
   }
