@@ -8,9 +8,11 @@
 #include <Update.h>
 #include <WiFiClientSecure.h>
 #include <DFRobotDFPlayerMini.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.2";
+const String CURRENT_VERSION = "1.3";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -57,6 +59,21 @@ const long interval = 1000; // 1 second
 
 WebServer server(80);
 
+// --- OTA ASYNC STATE & LOG BUFFER ---
+String otaLogBuffer = "[SYSTEM] Ready for firmware operations.\n";
+int otaProgressPercent = -1; // -1 = idle
+bool otaRunning = false;
+String otaState = "IDLE";
+TaskHandle_t otaTaskHandle = NULL;
+
+void logOTA(const String& msg) {
+  Serial.println(msg);
+  otaLogBuffer += msg + "\n";
+  if (otaLogBuffer.length() > 3000) {
+    otaLogBuffer = otaLogBuffer.substring(otaLogBuffer.length() - 2000);
+  }
+}
+
 // --- HTML & JAVASCRIPT DEBUG DASHBOARD ---
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
@@ -82,11 +99,14 @@ const char* htmlPage = R"rawliteral(
     .input-group { flex: 1; }
     .input-group input, .input-group select { width: 100%; }
     .ota-status { font-size: 12px; margin-top: 8px; color: #88ffbb; min-height: 16px; }
+    .console-box { background: #000; border: 1px solid #00ccff; color: #00ccff; height: 130px; overflow-y: scroll; font-size: 11px; padding: 8px; border-radius: 4px; margin-top: 6px; text-align: left; white-space: pre-wrap; word-break: break-all; font-family: monospace; }
+    .progress-bar-bg { background: #002233; border: 1px solid #00ccff; border-radius: 4px; height: 16px; overflow: hidden; margin: 8px 0; }
+    .progress-bar-fill { background: #00ccff; height: 100%; width: 0%; transition: width 0.3s ease; }
   </style>
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.2)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -152,9 +172,19 @@ const char* htmlPage = R"rawliteral(
   </div>
 
   <div class="card">
-    <label>FIRMWARE MANAGEMENT</label>
-    <button class="btn-ota" onclick="checkUpdate()">CHECK FOR FIRMWARE UPDATES</button>
-    <div id="otaStatus" class="ota-status"></div>
+    <label>FIRMWARE MANAGEMENT & OTA TERMINAL</label>
+    <button class="btn-ota" id="btnOta" onclick="checkUpdate()">CHECK FOR FIRMWARE UPDATES</button>
+    
+    <div id="otaProgressContainer" style="display:none;">
+      <div class="progress-bar-bg">
+        <div id="otaProgressBar" class="progress-bar-fill"></div>
+      </div>
+    </div>
+
+    <div style="text-align: left; margin-top: 8px;">
+      <label>LIVE OTA SERIAL LOGS</label>
+      <pre id="otaConsole" class="console-box">[SYSTEM] Ready for firmware operations.</pre>
+    </div>
   </div>
 
   <script>
@@ -174,18 +204,59 @@ const char* htmlPage = R"rawliteral(
       fetch('/setSpeed?val=' + val).catch(err => console.log(err));
     }
 
+    let otaPollInterval = null;
+
     function checkUpdate() {
-      let statusDiv = document.getElementById('otaStatus');
-      statusDiv.innerText = "CHECKING FOR UPDATES...";
+      document.getElementById('btnOta').disabled = true;
+      document.getElementById('btnOta').innerText = "CHECKING IN BACKGROUND...";
       fetch('/check-update')
         .then(res => res.text())
         .then(msg => {
-          statusDiv.innerText = msg;
+          startOtaPolling();
         })
         .catch(err => {
-          statusDiv.innerText = "UPDATE CHECK FAILED";
           console.log(err);
+          document.getElementById('btnOta').disabled = false;
+          document.getElementById('btnOta').innerText = "CHECK FOR FIRMWARE UPDATES";
         });
+    }
+
+    function startOtaPolling() {
+      if (otaPollInterval) clearInterval(otaPollInterval);
+      otaPollInterval = setInterval(pollOtaStatus, 500);
+      pollOtaStatus();
+    }
+
+    function pollOtaStatus() {
+      fetch('/ota-status')
+        .then(res => res.json())
+        .then(data => {
+          let consoleEl = document.getElementById('otaConsole');
+          if (data.logs) {
+            consoleEl.innerText = data.logs;
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+          }
+
+          let progressContainer = document.getElementById('otaProgressContainer');
+          let progressBar = document.getElementById('otaProgressBar');
+
+          if (data.progress >= 0) {
+            progressContainer.style.display = "block";
+            progressBar.style.width = data.progress + "%";
+          } else {
+            progressContainer.style.display = "none";
+          }
+
+          if (!data.running) {
+            document.getElementById('btnOta').disabled = false;
+            document.getElementById('btnOta').innerText = "CHECK FOR FIRMWARE UPDATES";
+            if (data.state === "SUCCESS") {
+              if (otaPollInterval) clearInterval(otaPollInterval);
+              document.getElementById('btnOta').innerText = "UPDATE COMPLETED - REBOOTING...";
+            }
+          }
+        })
+        .catch(err => console.log(err));
     }
 
     function playTrack() {
@@ -253,6 +324,7 @@ const char* htmlPage = R"rawliteral(
     }
 
     loadAudioInfo();
+    pollOtaStatus();
 
     setInterval(() => {
       fetch('/status')
@@ -323,68 +395,97 @@ bool isNewerVersion(const String& serverVer, const String& currentVer) {
   return (serverVer != currentVer) && (serverVer.length() > 0);
 }
 
-// --- REMOTE HTTPS OTA UPDATES ---
-bool checkForOTAUpdates() {
-  Serial.println("\n[OTA] Checking for firmware updates...");
-  Serial.printf("[OTA] Current Firmware Version: %s\n", CURRENT_VERSION.c_str());
+// --- BACKGROUND ASYNCHRONOUS OTA TASK ---
+void otaTaskFunction(void* pvParameters) {
+  otaRunning = true;
+  otaProgressPercent = 0;
+  otaState = "CONNECTING";
+  logOTA("\n[OTA] --- STARTING FIRMWARE UPDATE CHECK ---");
+  logOTA("[OTA] Current Firmware Version: v" + CURRENT_VERSION);
+  logOTA("[OTA] Connecting to GitHub manifest...");
 
   WiFiClientSecure client;
   client.setInsecure(); // Critical: GitHub rotates SSL certificates
 
   HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Critical: Follow raw GitHub CDN/redirects
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(15000);
 
   if (!http.begin(client, VERSION_URL)) {
-    Serial.println("[OTA] Error: Unable to connect to version URL.");
-    return false;
+    logOTA("[OTA] ERROR: Unable to connect to version URL.");
+    otaState = "ERROR";
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
 
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("[OTA] Version check failed, HTTP response code: %d\n", httpCode);
+    logOTA("[OTA] ERROR: Version check failed, HTTP code: " + String(httpCode));
     http.end();
-    return false;
+    otaState = "ERROR";
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
 
   String serverVersion = http.getString();
   serverVersion.trim();
   http.end();
 
-  Serial.printf("[OTA] Server Version: %s\n", serverVersion.c_str());
+  logOTA("[OTA] Server Manifest Version: v" + serverVersion);
 
   if (!isNewerVersion(serverVersion, CURRENT_VERSION)) {
-    Serial.println("[OTA] Device is already running the latest firmware.");
-    return false;
+    logOTA("[OTA] Device is running the latest firmware (v" + CURRENT_VERSION + ").");
+    otaState = "UP_TO_DATE";
+    otaProgressPercent = -1;
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
 
-  Serial.printf("[OTA] New version available (%s > %s). Initiating download...\n", serverVersion.c_str(), CURRENT_VERSION.c_str());
+  logOTA("[OTA] New version available (v" + serverVersion + " > v" + CURRENT_VERSION + ")!");
+  logOTA("[OTA] Connecting to GitHub binary stream...");
+  otaState = "DOWNLOADING";
 
   if (!http.begin(client, FIRMWARE_URL)) {
-    Serial.println("[OTA] Error: Unable to connect to firmware binary URL.");
-    return false;
+    logOTA("[OTA] ERROR: Unable to connect to firmware binary URL.");
+    otaState = "ERROR";
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   int fwHttpCode = http.GET();
   if (fwHttpCode != HTTP_CODE_OK) {
-    Serial.printf("[OTA] Firmware download request failed, HTTP response code: %d\n", fwHttpCode);
+    logOTA("[OTA] ERROR: Binary download failed, HTTP code: " + String(fwHttpCode));
     http.end();
-    return false;
+    otaState = "ERROR";
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
 
   int contentLength = http.getSize();
-  Serial.printf("[OTA] Binary size: %d bytes\n", contentLength);
+  logOTA("[OTA] Binary size: " + String(contentLength) + " bytes");
 
   if (contentLength <= 0) {
-    Serial.println("[OTA] Error: Invalid firmware content length.");
+    logOTA("[OTA] ERROR: Invalid content length received.");
     http.end();
-    return false;
+    otaState = "ERROR";
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
 
   if (!Update.begin(contentLength)) {
-    Serial.println("[OTA] Error: Insufficient space on partition for OTA update.");
+    logOTA("[OTA] ERROR: Insufficient flash partition space for OTA.");
     http.end();
-    return false;
+    otaState = "ERROR";
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
   }
 
   WiFiClient* stream = http.getStreamPtr();
@@ -392,7 +493,7 @@ bool checkForOTAUpdates() {
   uint8_t buff[1024] = { 0 };
   int lastProgress = -1;
 
-  Serial.println("[OTA] Writing firmware to flash partition...");
+  logOTA("[OTA] Streaming & flashing to secondary partition...");
 
   while (http.connected() && (written < (size_t)contentLength)) {
     size_t availableBytes = stream->available();
@@ -407,33 +508,39 @@ bool checkForOTAUpdates() {
         written += bytesRead;
 
         int progress = (int)((written * 100) / contentLength);
+        otaProgressPercent = progress;
         if (progress != lastProgress && (progress % 10 == 0 || progress == 100)) {
-          Serial.printf("[OTA] Progress: %d%%\n", progress);
+          logOTA("[OTA] Progress: " + String(progress) + "% (" + String(written) + "/" + String(contentLength) + " bytes)");
           lastProgress = progress;
         }
       }
     }
-    yield();
+    vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 
   http.end();
 
   if (written == (size_t)contentLength) {
     if (Update.end(true)) {
-      Serial.println("[OTA] Update successfully written to flash partition!");
-      Serial.println("[OTA] Rebooting ESP32 into new firmware...");
-      delay(500);
+      logOTA("[OTA] SUCCESS! Firmware successfully flashed.");
+      logOTA("[OTA] REBOOTING ESP32 IN 2 SECONDS...");
+      otaState = "SUCCESS";
+      otaProgressPercent = 100;
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
       ESP.restart();
-      return true;
     } else {
-      Serial.printf("[OTA] Update error during finalization. Error #: %d\n", Update.getError());
-      return false;
+      logOTA("[OTA] ERROR: Update finalization error #" + String(Update.getError()));
+      otaState = "ERROR";
+      otaRunning = false;
     }
   } else {
-    Serial.printf("[OTA] Incomplete payload received (%u of %d bytes). Aborting.\n", written, contentLength);
+    logOTA("[OTA] ERROR: Incomplete payload received (" + String(written) + "/" + String(contentLength) + " bytes).");
     Update.abort();
-    return false;
+    otaState = "ERROR";
+    otaRunning = false;
   }
+
+  vTaskDelete(NULL);
 }
 
 // --- WEB SERVER ENDPOINTS ---
@@ -512,17 +619,29 @@ void handleSetSpeed() {
 }
 
 void handleCheckUpdate() {
-  Serial.println("\n[SYSTEM] Manual OTA check triggered from web dashboard.");
-  isPaused = true;
-
-  bool updateSuccess = checkForOTAUpdates();
-
-  if (!updateSuccess) {
-    isPaused = false; // Safely resume countdown timer if no update found/applied
-    server.send(200, "text/plain", "Firmware is up to date (v" + CURRENT_VERSION + ")");
-  } else {
-    server.send(200, "text/plain", "Update successful! Rebooting...");
+  if (otaRunning) {
+    server.send(200, "text/plain", "Update check already in progress.");
+    return;
   }
+  otaLogBuffer = ""; // Reset console logs for new run
+  logOTA("[SYSTEM] OTA update check triggered via Web Dashboard.");
+  xTaskCreatePinnedToCore(otaTaskFunction, "OTA_Task", 8192, NULL, 1, &otaTaskHandle, 0);
+  server.send(200, "text/plain", "OTA check started in background...");
+}
+
+void handleOtaStatus() {
+  String json = "{";
+  json += "\"running\":" + String(otaRunning ? "true" : "false") + ",";
+  json += "\"state\":\"" + otaState + "\",";
+  json += "\"progress\":" + String(otaProgressPercent) + ",";
+  String escapedLogs = otaLogBuffer;
+  escapedLogs.replace("\\", "\\\\");
+  escapedLogs.replace("\"", "\\\"");
+  escapedLogs.replace("\n", "\\n");
+  escapedLogs.replace("\r", "");
+  json += "\"logs\":\"" + escapedLogs + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 // --- AUDIO WEB HANDLERS ---
@@ -616,6 +735,7 @@ void setup() {
   server.on("/setFlap", HTTP_GET, handleSetFlap);
   server.on("/setSpeed", HTTP_GET, handleSetSpeed); 
   server.on("/check-update", HTTP_GET, handleCheckUpdate);
+  server.on("/ota-status", HTTP_GET, handleOtaStatus);
   server.on("/playTrack", HTTP_GET, handlePlayTrack);
   server.on("/stopAudio", HTTP_GET, handleStopAudio);
   server.on("/setVolume", HTTP_GET, handleSetVolume);
