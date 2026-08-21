@@ -10,9 +10,10 @@
 #include <DFRobotDFPlayerMini.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.3.5";
+const String CURRENT_VERSION = "1.4.0";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -48,6 +49,23 @@ const float STEPS_PER_FLAP = (float)STEPS_PER_REV / (float)TOTAL_FLAPS; // 91.02
 bool isHome = false;
 int currentFlapPosition = 0;
 long absoluteFlapCount = 0; // Tracks total lifetime flaps to eliminate math drift
+
+// --- CALIBRATION STORAGE (NVS PREFERENCES) ---
+Preferences prefs;
+int masterHomeOffsetSteps = (int)(8 * STEPS_PER_FLAP); // Default fallback ~728 steps
+
+void loadMasterCalibration() {
+  prefs.begin("calibration", false);
+  masterHomeOffsetSteps = prefs.getInt("masterOffset", (int)(8 * STEPS_PER_FLAP));
+  prefs.end();
+}
+
+void saveMasterCalibration(int newOffset) {
+  prefs.begin("calibration", false);
+  prefs.putInt("masterOffset", newOffset);
+  prefs.end();
+  masterHomeOffsetSteps = newOffset;
+}
 
 // --- TIMER VARIABLES ---
 const int START_MINUTES = 108;
@@ -106,7 +124,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.3.5)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.4.0)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -172,6 +190,41 @@ const char* htmlPage = R"rawliteral(
   </div>
 
   <div class="card">
+    <label>DRUM ZERO CALIBRATION TOOL</label>
+    <p style="font-size: 11px; color: #88ffbb; margin-top: 2px; margin-bottom: 8px;">
+      Jog drum until visible flap is the <b>"0" right after red hieroglyphs</b>, then click <b>SET AS HOME (FLAP 0)</b>.
+    </p>
+    
+    <div class="input-row">
+      <div class="input-group">
+        <label>SELECT DRUM UNIT</label>
+        <select id="calUnitSelect">
+          <option value="0">Master Drum (Digit 1 - Local)</option>
+          <option value="1">Slave 1 (Digit 2 - I2C 0x01)</option>
+          <option value="2">Slave 2 (Digit 3 - I2C 0x02)</option>
+          <option value="3">Slave 3 (Digit 4 - I2C 0x03)</option>
+          <option value="4">Slave 4 (Digit 5 - I2C 0x04)</option>
+        </select>
+      </div>
+    </div>
+
+    <label style="margin-top: 6px;">STEPPING & JOG CONTROLS</label>
+    <div class="input-row">
+      <button style="flex:1; padding: 10px 5px; font-size: 13px;" onclick="jogFlaps(1)">+1 FLAP</button>
+      <button style="flex:1; padding: 10px 5px; font-size: 13px;" onclick="jogFlaps(5)">+5 FLAPS</button>
+      <button style="flex:1; padding: 10px 5px; font-size: 13px;" onclick="jogFlaps(10)">+10 FLAPS</button>
+    </div>
+    <div class="input-row" style="margin-top: 5px;">
+      <button style="flex:1; padding: 8px 5px; font-size: 12px; border-color: #88ffbb; color: #88ffbb;" onclick="jogSteps(10)">+10 STEPS (FINE TUNE)</button>
+    </div>
+
+    <button style="background-color: #00441b; border-color: #00ff66; margin-top: 10px; padding: 12px;" onclick="setAsHome()">SET CURRENT POSITION AS HOME (FLAP 0)</button>
+    <button style="background-color: #002244; border-color: #00ccff; color: #00ccff; margin-top: 4px; padding: 8px; font-size: 12px;" onclick="reHomeDrum()">RE-HOME & VERIFY ALIGNMENT</button>
+    
+    <div id="calStatus" class="ota-status" style="color: #ffff88; margin-top: 6px;"></div>
+  </div>
+
+  <div class="card">
     <label>I2C BUS DIAGNOSTICS & SLAVE SCANNER</label>
     <button class="btn-ota" id="btnScanI2C" onclick="runI2CScan()">SCAN I2C BUS (0x01 - 0x77)</button>
     <pre id="i2cScanResults" class="console-box" style="height: 90px; color: #88ffbb; border-color: #00ff66;">[SYSTEM] Ready to scan I2C bus.</pre>
@@ -221,6 +274,46 @@ const char* htmlPage = R"rawliteral(
       let val = document.getElementById('speedSlider').value;
       document.getElementById('speedLabel').innerText = val + " Steps/Sec";
       fetch('/setSpeed?val=' + val).catch(err => console.log(err));
+    }
+
+    function jogFlaps(flaps) {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Jogging Drum " + unit + " by +" + flaps + " flaps...";
+      fetch('/calibrateJog?unit=' + unit + '&flaps=' + flaps)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function jogSteps(steps) {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Jogging Drum " + unit + " by +" + steps + " steps...";
+      fetch('/calibrateJog?unit=' + unit + '&steps=' + steps)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function setAsHome() {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Saving Flap 0 Home Position for Drum " + unit + "...";
+      fetch('/setHome?unit=' + unit)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function reHomeDrum() {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Re-homing Drum " + unit + "...";
+      fetch('/reHome?unit=' + unit)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
     }
 
     function runI2CScan() {
@@ -433,6 +526,7 @@ void goToFlap(int targetFlap, int extraRotations = 0) {
 
 void findHome() {
   Serial.println("[SYSTEM] SEEKING HOME POSITION...");
+  stepper.setMaxSpeed(800);
   stepper.setSpeed(-400); 
 
   while (digitalRead(hallSensorPin) == HIGH) {
@@ -445,12 +539,17 @@ void findHome() {
     stepper.runSpeed();
   }
 
-  absoluteFlapCount = 8; 
-  long homeSteps = -1 * (long)(absoluteFlapCount * STEPS_PER_FLAP);
-  stepper.setCurrentPosition(homeSteps);
-  currentFlapPosition = 8; 
+  // Move forward by stored calibration offset to land precisely on Flap 0
+  stepper.moveTo(-1 * masterHomeOffsetSteps);
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+  }
+
+  stepper.setCurrentPosition(0);
+  currentFlapPosition = 0;
+  absoluteFlapCount = 0;
   
-  Serial.println("\n[SUCCESS] HOME LOCKED. INDEXED TO FLAP 8.");
+  Serial.printf("\n[SUCCESS] HOME LOCKED (Offset: %d steps). INDEXED TO FLAP 0.\n", masterHomeOffsetSteps);
 }
 
 // --- VERSION COMPARISON HELPER (SEMANTIC MAJOR.MINOR.PATCH) ---
@@ -824,10 +923,101 @@ void handleTestSlave() {
   }
 }
 
+void handleCalibrateJog() {
+  int unit = server.hasArg("unit") ? server.arg("unit").toInt() : 0;
+  int flaps = server.hasArg("flaps") ? server.arg("flaps").toInt() : 0;
+  int steps = server.hasArg("steps") ? server.arg("steps").toInt() : 0;
+
+  isPaused = true;
+
+  if (unit == 0) {
+    // Master Drum (Local ESP32)
+    long delta = 0;
+    if (flaps > 0) delta = (long)(flaps * STEPS_PER_FLAP);
+    if (steps > 0) delta += steps;
+    
+    stepper.move(-1 * delta);
+    while (stepper.distanceToGo() != 0) {
+      stepper.run();
+    }
+    server.send(200, "text/plain", "Master jogged by " + (flaps > 0 ? String(flaps) + " flaps." : String(steps) + " steps."));
+  } else {
+    // Slave Drum (Arduino Nano over I2C)
+    Wire.setTimeOut(30);
+    Wire.beginTransmission((uint8_t)unit);
+    if (flaps > 0) {
+      Wire.write((uint8_t)250); // 0xFA: Jog Flaps
+      Wire.write((uint8_t)flaps);
+    } else {
+      Wire.write((uint8_t)251); // 0xFB: Jog Steps
+      Wire.write((uint8_t)steps);
+    }
+    uint8_t err = Wire.endTransmission(true);
+    if (err == 0) {
+      server.send(200, "text/plain", "Slave " + String(unit) + " jogged " + (flaps > 0 ? String(flaps) + " flaps." : String(steps) + " steps."));
+    } else {
+      server.send(200, "text/plain", "I2C Error code " + String(err) + " communicating with Slave " + String(unit));
+    }
+  }
+}
+
+void handleSetHome() {
+  int unit = server.hasArg("unit") ? server.arg("unit").toInt() : 0;
+
+  if (unit == 0) {
+    // Master Drum: Save current offset from Hall trigger
+    long currentRelOffset = -1 * stepper.currentPosition();
+    masterHomeOffsetSteps = (int)(masterHomeOffsetSteps + currentRelOffset);
+    while (masterHomeOffsetSteps < 0) masterHomeOffsetSteps += STEPS_PER_REV;
+    masterHomeOffsetSteps = masterHomeOffsetSteps % STEPS_PER_REV;
+    saveMasterCalibration(masterHomeOffsetSteps);
+    
+    stepper.setCurrentPosition(0);
+    currentFlapPosition = 0;
+    absoluteFlapCount = 0;
+    Serial.printf("[CALIBRATION] Master Home saved: %d steps\n", masterHomeOffsetSteps);
+    server.send(200, "text/plain", "SUCCESS: Master Flap 0 saved (" + String(masterHomeOffsetSteps) + " steps).");
+  } else {
+    // Slave Drum: Send 0xFC (252) to save EEPROM
+    Wire.setTimeOut(30);
+    Wire.beginTransmission((uint8_t)unit);
+    Wire.write((uint8_t)252);
+    Wire.write((uint8_t)0);
+    uint8_t err = Wire.endTransmission(true);
+    if (err == 0) {
+      server.send(200, "text/plain", "SUCCESS: Slave " + String(unit) + " Home (Flap 0) saved into EEPROM.");
+    } else {
+      server.send(200, "text/plain", "I2C Error " + String(err) + " saving to Slave " + String(unit));
+    }
+  }
+}
+
+void handleReHome() {
+  int unit = server.hasArg("unit") ? server.arg("unit").toInt() : 0;
+
+  if (unit == 0) {
+    findHome();
+    server.send(200, "text/plain", "Master Drum re-homed to Flap 0.");
+  } else {
+    Wire.setTimeOut(30);
+    Wire.beginTransmission((uint8_t)unit);
+    Wire.write((uint8_t)253);
+    Wire.write((uint8_t)0);
+    uint8_t err = Wire.endTransmission(true);
+    if (err == 0) {
+      server.send(200, "text/plain", "Slave " + String(unit) + " re-homed to Flap 0.");
+    } else {
+      server.send(200, "text/plain", "I2C Error " + String(err) + " re-homing Slave " + String(unit));
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=== SWAN STATION MASTER BRAIN INITIALIZING ===");
+
+  loadMasterCalibration();
 
   pinMode(hallSensorPin, INPUT_PULLUP);
   pinMode(potPin, INPUT);
@@ -873,6 +1063,9 @@ void setup() {
   server.on("/togglePause", HTTP_GET, handleTogglePause);
   server.on("/setFlap", HTTP_GET, handleSetFlap);
   server.on("/setSpeed", HTTP_GET, handleSetSpeed); 
+  server.on("/calibrateJog", HTTP_GET, handleCalibrateJog);
+  server.on("/setHome", HTTP_GET, handleSetHome);
+  server.on("/reHome", HTTP_GET, handleReHome);
   server.on("/scanI2C", HTTP_GET, handleScanI2C);
   server.on("/testSlave", HTTP_GET, handleTestSlave);
   server.on("/check-update", HTTP_GET, handleCheckUpdate);

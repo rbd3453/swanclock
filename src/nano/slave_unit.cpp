@@ -1,7 +1,7 @@
 /*********
   Split Flap Arduino Nano Slave Unit Firmware
   Target: Arduino Nano (ATmega328P)
-  High-Torque Half-Step Drive via AccelStepper
+  High-Torque Half-Step Drive via AccelStepper with I2C Calibration
 *********/
 
 #include <Arduino.h>
@@ -40,6 +40,10 @@ int eeAddress = 0;         // EEPROM start address for offset
 int calOffset = 0;         // Calibration offset in steps
 int i2cAddress = 1;
 
+// I2C Command Buffer
+volatile uint8_t pendingCmd = 0;
+volatile int pendingParam = 0;
+
 // Forward declarations
 void calibrate(bool initialCalibration);
 void rotateToLetter(int toLetter);
@@ -56,12 +60,12 @@ int getaddress() {
 // Fetch magnet sensor offset from EEPROM
 void getOffset() {
   EEPROM.get(eeAddress, calOffset);
-  if (calOffset < -4000 || calOffset > 4000) {
+  if (calOffset < -4096 || calOffset > 4096) {
     calOffset = 0;
   }
 }
 
-// Calibrate drum using Hall-effect sensor
+// Calibrate drum using Hall-effect sensor and stored EEPROM offset
 void calibrate(bool initialCalibration) {
   currentlyrotating = 1;
   stepper.enableOutputs();
@@ -85,7 +89,7 @@ void calibrate(bool initialCalibration) {
   // If magnet found
   if (digitalRead(HALLPIN) == LOW) {
     stepper.setCurrentPosition(0);
-    // Apply calibration offset if any
+    // Apply calibration offset stored in EEPROM to land on Flap 0
     if (calOffset != 0) {
       stepper.moveTo(-1 * calOffset);
       while (stepper.distanceToGo() != 0) {
@@ -131,16 +135,17 @@ void rotateToLetter(int toLetter) {
 // I2C Receive Event Handler (ESP32 -> Slave)
 void receiveLetter(int numBytes) {
   if (numBytes >= 1) {
-    int target = Wire.read();
-    if (target >= 0 && target < AMOUNTFLAPS) {
-      desiredLetter = target;
+    int cmd = Wire.read();
+    if (cmd >= 0 && cmd < AMOUNTFLAPS) {
+      desiredLetter = cmd;
+    } else {
+      pendingCmd = (uint8_t)cmd;
     }
   }
   if (numBytes >= 2) {
-    int spd = Wire.read(); // optional speed param
-    (void)spd;
+    pendingParam = Wire.read();
   }
-  // Flush any extraneous bytes to prevent buffer overflow
+  // Flush any extraneous bytes
   while (Wire.available()) {
     Wire.read();
   }
@@ -176,7 +181,56 @@ void setup() {
 }
 
 void loop() {
-  // Check if a new letter index was received over I2C
+  // Process any pending I2C calibration / jog commands
+  if (pendingCmd != 0) {
+    uint8_t cmd = pendingCmd;
+    int param = pendingParam;
+    pendingCmd = 0;
+
+    if (cmd == 250) {
+      // 0xFA: Jog Flaps
+      int flaps = param > 0 ? param : 1;
+      currentlyrotating = 1;
+      stepper.enableOutputs();
+      long delta = -1 * (long)(flaps * STEPS_PER_FLAP);
+      stepper.move(delta);
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+      currentlyrotating = 0;
+      stepper.disableOutputs();
+    } 
+    else if (cmd == 251) {
+      // 0xFB: Fine Step Jog
+      int steps = param > 0 ? param : 10;
+      currentlyrotating = 1;
+      stepper.enableOutputs();
+      stepper.move(-1 * steps);
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+      currentlyrotating = 0;
+      stepper.disableOutputs();
+    } 
+    else if (cmd == 252) {
+      // 0xFC: Save current position as Home (Flap 0) into EEPROM
+      long deltaSteps = -1 * stepper.currentPosition();
+      calOffset = (int)(calOffset + deltaSteps);
+      while (calOffset < 0) calOffset += STEPS_PER_REV;
+      calOffset = calOffset % STEPS_PER_REV;
+      EEPROM.put(eeAddress, calOffset);
+      stepper.setCurrentPosition(0);
+      displayedLetter = 0;
+      desiredLetter = 0;
+      stepper.disableOutputs();
+    } 
+    else if (cmd == 253) {
+      // 0xFD: Re-Home drum
+      calibrate(true);
+    }
+  }
+
+  // Check if a new target flap index was received over I2C
   if (displayedLetter != desiredLetter) {
     rotateToLetter(desiredLetter);
   }
