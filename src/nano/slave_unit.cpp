@@ -1,13 +1,13 @@
 /*********
   Split Flap Arduino Nano Slave Unit Firmware
   Target: Arduino Nano (ATmega328P)
+  High-Torque Half-Step Drive via AccelStepper
 *********/
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Stepper.h>
+#include <AccelStepper.h>
 #include <EEPROM.h>
-#include <avr/sleep.h>
 
 // Pins of I2C address DIP switch (Active LOW with INPUT_PULLUP)
 #define ADRESSSW1 6
@@ -20,41 +20,28 @@
 #define STEPPERPIN2 10
 #define STEPPERPIN3 9
 #define STEPPERPIN4 8
-#define STEPS 2038         // 28BYJ-48 stepper steps per revolution (~2038)
-#define HALLPIN 7          // KY-003 Hall sensor pin (Active LOW when magnet detected)
-#define AMOUNTFLAPS 45     // Total flaps per drum
 
-// Constants
-#define BAUDRATE 115200
-#define ROTATIONDIRECTION -1 // -1 for reverse direction
-#define OVERHEATINGTIMEOUT 2 // Seconds idle timeout before disabling coils
-unsigned long lastRotation = 0;
+// Stepper Constants (Half-step 8-phase high-torque sequence)
+const int STEPS_PER_REV = 4096;
+const int AMOUNTFLAPS = 45;
+const float STEPS_PER_FLAP = (float)STEPS_PER_REV / (float)AMOUNTFLAPS; // 91.02222
+
+#define HALLPIN 7 // KY-003 Hall sensor pin (Active LOW when magnet detected)
+
+// Initialize AccelStepper in 4-wire half-step mode: pin sequence 1, 3, 2, 4
+AccelStepper stepper(AccelStepper::HALF4WIRE, STEPPERPIN1, STEPPERPIN3, STEPPERPIN2, STEPPERPIN4);
 
 // Globals
 int displayedLetter = 0;   // Currently shown flap index (0 to AMOUNTFLAPS - 1)
 volatile int desiredLetter = 0;     // Flap index requested via I2C
-Stepper stepper(STEPS, STEPPERPIN1, STEPPERPIN3, STEPPERPIN2, STEPPERPIN4);
-
-bool lastInd1 = false;
-bool lastInd2 = false;
-bool lastInd3 = false;
-bool lastInd4 = false;
-float missedSteps = 0;     // Fractional step accumulator
-
 volatile int currentlyrotating = 0; // 1 = rotating, 0 = stationary
-volatile int stepperSpeed = 10;     // Default speed RPM
+
 int eeAddress = 0;         // EEPROM start address for offset
 int calOffset = 0;         // Calibration offset in steps
 int i2cAddress = 1;
 
-// Sleep globals
-const unsigned long WAIT_TIME = 2000; // ms idle before sleep
-unsigned long previousSleepMillis = 0;
-
 // Forward declarations
-void startMotor();
-void stopMotor();
-int calibrate(bool initialCalibration);
+void calibrate(bool initialCalibration);
 void rotateToLetter(int toLetter);
 
 // Return I2C address (1 to 15) from 4-bit DIP switches
@@ -69,111 +56,76 @@ int getaddress() {
 // Fetch magnet sensor offset from EEPROM
 void getOffset() {
   EEPROM.get(eeAddress, calOffset);
-  if (calOffset < -2000 || calOffset > 2000) {
+  if (calOffset < -4000 || calOffset > 4000) {
     calOffset = 0;
   }
 }
 
 // Calibrate drum using Hall-effect sensor
-int calibrate(bool initialCalibration) {
+void calibrate(bool initialCalibration) {
   currentlyrotating = 1;
-  bool reachedMarker = false;
-  stepper.setSpeed(stepperSpeed > 0 ? stepperSpeed : 10);
-  int i = 0;
+  stepper.enableOutputs();
+  stepper.setSpeed(-500);
 
-  while (!reachedMarker) {
-    int currentHallValue = digitalRead(HALLPIN);
-    
-    // If magnet is already present on startup (LOW), advance 50 steps to clear it
-    if (currentHallValue == LOW && i == 0) {
-      i = 50;
-      stepper.step(ROTATIONDIRECTION * 50);
-    } else if (currentHallValue == HIGH) {
-      // Magnet not yet reached
-      stepper.step(ROTATIONDIRECTION * 1);
-    } else {
-      // Reached magnet marker! Advance by calibration offset to align flap 0
-      reachedMarker = true;
-      if (calOffset != 0) {
-        stepper.step(ROTATIONDIRECTION * calOffset);
-      }
-      displayedLetter = 0;
-      missedSteps = 0;
-      if (initialCalibration) {
-        stopMotor();
-      }
-      return i;
-    }
-
-    if (i > 3 * STEPS) {
-      // Timeout safety: Hall sensor not detected
-      displayedLetter = 0;
-      desiredLetter = 0;
-      reachedMarker = true;
-      stopMotor();
-      return -1;
-    }
-    i++;
-  }
-  return i;
-}
-
-// Move to specified flap index
-void rotateToLetter(int toLetter) {
-  if (lastRotation == 0 || (millis() - lastRotation > (unsigned long)(OVERHEATINGTIMEOUT * 1000))) {
-    lastRotation = millis();
-    int posLetter = toLetter;
-    int posCurrentLetter = displayedLetter;
-
-    if (posLetter >= 0 && posLetter < AMOUNTFLAPS) {
-      if (posLetter >= posCurrentLetter) {
-        int diffPosition = posLetter - posCurrentLetter;
-        startMotor();
-        stepper.setSpeed(stepperSpeed > 0 ? stepperSpeed : 10);
-        for (int i = 0; i < diffPosition; i++) {
-          float preciseStep = (float)STEPS / (float)AMOUNTFLAPS;
-          int roundedStep = (int)preciseStep;
-          missedSteps += (preciseStep - (float)roundedStep);
-          if (missedSteps > 1.0f) {
-            roundedStep += 1;
-            missedSteps -= 1.0f;
-          }
-          stepper.step(ROTATIONDIRECTION * roundedStep);
-        }
-      } else {
-        // Forward wrap-around: perform homing calibration to re-index at flap 0
-        calibrate(false);
-        startMotor();
-        stepper.setSpeed(stepperSpeed > 0 ? stepperSpeed : 10);
-        for (int i = 0; i < posLetter; i++) {
-          float preciseStep = (float)STEPS / (float)AMOUNTFLAPS;
-          int roundedStep = (int)preciseStep;
-          missedSteps += (preciseStep - (float)roundedStep);
-          if (missedSteps > 1.0f) {
-            roundedStep += 1;
-            missedSteps -= 1.0f;
-          }
-          stepper.step(ROTATIONDIRECTION * roundedStep);
-        }
-      }
-      displayedLetter = toLetter;
-      delay(50);
-      stopMotor();
+  // If magnet is already present on startup (LOW), advance 150 steps to clear it
+  if (digitalRead(HALLPIN) == LOW) {
+    long clearTarget = stepper.currentPosition() - 150;
+    stepper.moveTo(clearTarget);
+    while (stepper.distanceToGo() != 0) {
+      stepper.run();
     }
   }
-}
 
-// Power off motor coils to prevent heating when stationary
-void stopMotor() {
-  digitalWrite(STEPPERPIN1, LOW);
-  digitalWrite(STEPPERPIN2, LOW);
-  digitalWrite(STEPPERPIN3, LOW);
-  digitalWrite(STEPPERPIN4, LOW);
+  // Seek magnet in homing direction
+  long maxSearch = stepper.currentPosition() - (long)(STEPS_PER_REV * 2);
+  while (digitalRead(HALLPIN) == HIGH && stepper.currentPosition() > maxSearch) {
+    stepper.runSpeed();
+  }
+
+  // If magnet found
+  if (digitalRead(HALLPIN) == LOW) {
+    stepper.setCurrentPosition(0);
+    // Apply calibration offset if any
+    if (calOffset != 0) {
+      stepper.moveTo(-1 * calOffset);
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+      stepper.setCurrentPosition(0);
+    }
+    displayedLetter = 0;
+    desiredLetter = 0;
+  }
+
   currentlyrotating = 0;
+  if (initialCalibration) {
+    stepper.disableOutputs(); // Cut coil power to stay cool
+  }
 }
 
-void startMotor() {
+// Move to specified flap index with high torque & smooth acceleration
+void rotateToLetter(int toLetter) {
+  if (toLetter < 0 || toLetter >= AMOUNTFLAPS) return;
+  if (toLetter == displayedLetter) return;
+
   currentlyrotating = 1;
+  stepper.enableOutputs();
+
+  int flapsToAdvance = toLetter - displayedLetter;
+  if (flapsToAdvance < 0) {
+    flapsToAdvance += AMOUNTFLAPS;
+  }
+
+  long targetSteps = stepper.currentPosition() - (long)(flapsToAdvance * STEPS_PER_FLAP);
+  stepper.moveTo(targetSteps);
+
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+  }
+
+  displayedLetter = toLetter;
+  currentlyrotating = 0;
+  stepper.disableOutputs(); // Power off motor coils to prevent heating
 }
 
 // I2C Receive Event Handler (ESP32 -> Slave)
@@ -185,10 +137,8 @@ void receiveLetter(int numBytes) {
     }
   }
   if (numBytes >= 2) {
-    int spd = Wire.read();
-    if (spd > 0) {
-      stepperSpeed = spd;
-    }
+    int spd = Wire.read(); // optional speed param
+    (void)spd;
   }
   // Flush any extraneous bytes to prevent buffer overflow
   while (Wire.available()) {
@@ -208,8 +158,12 @@ void setup() {
   pinMode(ADRESSSW3, INPUT_PULLUP);
   pinMode(ADRESSSW4, INPUT_PULLUP);
 
-  // KY-003 Hall sensor (ensure internal pullup in case board lacks resistor)
+  // KY-003 Hall sensor
   pinMode(HALLPIN, INPUT_PULLUP);
+
+  // High-Torque Stepper Configuration
+  stepper.setMaxSpeed(700);     // Optimal torque speed for 28BYJ-48 (~10 RPM)
+  stepper.setAcceleration(500); // Smooth torque ramp to push past flap resistance
 
   i2cAddress = getaddress();
 
