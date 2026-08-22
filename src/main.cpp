@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.0";
+const String CURRENT_VERSION = "1.4.1";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -124,7 +124,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.4.0)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.4.1)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -175,8 +175,20 @@ const char* htmlPage = R"rawliteral(
   </div>
 
   <div class="card">
-    <label>DEBUG OVERRIDE: TARGET & ROTATIONS</label>
+    <label>MANUAL FLAP CONTROL</label>
     <div class="input-row">
+      <div class="input-group">
+        <label>TARGET DRUM</label>
+        <select id="flapUnitSelect">
+          <option value="0">Master Drum (Digit 1 - Local)</option>
+          <option value="1">Slave 1 (Digit 2 - I2C 0x01)</option>
+          <option value="2">Slave 2 (Digit 3 - I2C 0x02)</option>
+          <option value="3">Slave 3 (Digit 4 - I2C 0x03)</option>
+          <option value="4">Slave 4 (Digit 5 - I2C 0x04)</option>
+        </select>
+      </div>
+    </div>
+    <div class="input-row" style="margin-top: 6px;">
       <div class="input-group">
         <label>TARGET FLAP (0-44)</label>
         <input type="number" id="flapInput" min="0" max="44" value="1">
@@ -187,12 +199,13 @@ const char* htmlPage = R"rawliteral(
       </div>
     </div>
     <button onclick="submitFlap()">SET POSITION (AUTO-PAUSES TIMER)</button>
+    <div id="flapControlStatus" class="ota-status" style="color: #ff88ff; margin-top: 4px;"></div>
   </div>
 
   <div class="card">
     <label>DRUM ZERO CALIBRATION TOOL</label>
     <p style="font-size: 11px; color: #88ffbb; margin-top: 2px; margin-bottom: 8px;">
-      Jog drum until visible flap is the <b>"0" right after red hieroglyphs</b>, then click <b>SET AS HOME (FLAP 0)</b>.
+      Jog drum until visible flap is the <b>BLANK FLAP</b> (Home baseline), then click <b>SET AS HOME (BLANK FLAP)</b>.
     </p>
     
     <div class="input-row">
@@ -218,7 +231,7 @@ const char* htmlPage = R"rawliteral(
       <button style="flex:1; padding: 8px 5px; font-size: 12px; border-color: #88ffbb; color: #88ffbb;" onclick="jogSteps(10)">+10 STEPS (FINE TUNE)</button>
     </div>
 
-    <button style="background-color: #00441b; border-color: #00ff66; margin-top: 10px; padding: 12px;" onclick="setAsHome()">SET CURRENT POSITION AS HOME (FLAP 0)</button>
+    <button style="background-color: #00441b; border-color: #00ff66; margin-top: 10px; padding: 12px;" onclick="setAsHome()">SET CURRENT POSITION AS HOME (BLANK FLAP)</button>
     <button style="background-color: #002244; border-color: #00ccff; color: #00ccff; margin-top: 4px; padding: 8px; font-size: 12px;" onclick="reHomeDrum()">RE-HOME & VERIFY ALIGNMENT</button>
     
     <div id="calStatus" class="ota-status" style="color: #ffff88; margin-top: 6px;"></div>
@@ -265,9 +278,15 @@ const char* htmlPage = R"rawliteral(
     }
     
     function submitFlap() {
+      let unit = document.getElementById('flapUnitSelect').value;
       let val = document.getElementById('flapInput').value;
       let rot = document.getElementById('rotationsInput').value;
-      fetch('/setFlap?val=' + val + '&rot=' + rot).catch(err => console.log(err));
+      let statusEl = document.getElementById('flapControlStatus');
+      statusEl.innerText = "Setting Drum " + unit + " to Flap " + val + "...";
+      fetch('/setFlap?unit=' + unit + '&val=' + val + '&rot=' + rot)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
     }
 
     function submitSpeed() {
@@ -518,6 +537,7 @@ void goToFlap(int targetFlap, int extraRotations = 0) {
   
   absoluteFlapCount += totalFlapsToMove;
   long targetSteps = -1 * (long)(absoluteFlapCount * STEPS_PER_FLAP);
+  stepper.enableOutputs(); // Energize motor coils for motion
   stepper.moveTo(targetSteps);
   
   // Update internal tracker to the new resting spot
@@ -526,6 +546,7 @@ void goToFlap(int targetFlap, int extraRotations = 0) {
 
 void findHome() {
   Serial.println("[SYSTEM] SEEKING HOME POSITION...");
+  stepper.enableOutputs();
   stepper.setMaxSpeed(800);
   stepper.setSpeed(-400); 
 
@@ -539,7 +560,7 @@ void findHome() {
     stepper.runSpeed();
   }
 
-  // Move forward by stored calibration offset to land precisely on Flap 0
+  // Move forward by stored calibration offset to land precisely on Blank Flap (Flap 0)
   stepper.moveTo(-1 * masterHomeOffsetSteps);
   while (stepper.distanceToGo() != 0) {
     stepper.run();
@@ -548,8 +569,9 @@ void findHome() {
   stepper.setCurrentPosition(0);
   currentFlapPosition = 0;
   absoluteFlapCount = 0;
+  stepper.disableOutputs(); // De-energize motor coils when stationary to prevent heating!
   
-  Serial.printf("\n[SUCCESS] HOME LOCKED (Offset: %d steps). INDEXED TO FLAP 0.\n", masterHomeOffsetSteps);
+  Serial.printf("\n[SUCCESS] HOME LOCKED (Offset: %d steps). INDEXED TO BLANK FLAP (0).\n", masterHomeOffsetSteps);
 }
 
 // --- VERSION COMPARISON HELPER (SEMANTIC MAJOR.MINOR.PATCH) ---
@@ -760,18 +782,28 @@ void handleTogglePause() {
 void handleSetFlap() {
   if (server.hasArg("val")) {
     int target = server.arg("val").toInt();
-    int rot = 0;
-    
-    // Check if the secondary extra rotations parameter was passed
-    if (server.hasArg("rot")) {
-      rot = server.arg("rot").toInt();
-    }
+    int rot = server.hasArg("rot") ? server.arg("rot").toInt() : 0;
+    int unit = server.hasArg("unit") ? server.arg("unit").toInt() : 0;
     
     isPaused = true; 
-    Serial.printf("[DEBUG] Manual override: Moving to Flap %d with %d Extra Rotations\n", target, rot);
     
-    goToFlap(target, rot);
-    server.send(200, "text/plain", "OK");
+    if (unit == 0) {
+      Serial.printf("[DEBUG] Manual override: Master Drum moving to Flap %d (+%d rot)\n", target, rot);
+      goToFlap(target, rot);
+      server.send(200, "text/plain", "Master Drum set to Flap " + String(target));
+    } else {
+      Serial.printf("[DEBUG] Manual override: Sending Flap %d to Slave Unit %d\n", target, unit);
+      Wire.setTimeOut(30);
+      Wire.beginTransmission((uint8_t)unit);
+      Wire.write((uint8_t)target);
+      Wire.write((uint8_t)10); // Speed RPM
+      uint8_t err = Wire.endTransmission(true);
+      if (err == 0) {
+        server.send(200, "text/plain", "Slave " + String(unit) + " set to Flap " + String(target));
+      } else {
+        server.send(200, "text/plain", "I2C Error code " + String(err) + " on Slave " + String(unit));
+      }
+    }
   } else {
     server.send(400, "text/plain", "Missing Parameter");
   }
@@ -936,10 +968,12 @@ void handleCalibrateJog() {
     if (flaps > 0) delta = (long)(flaps * STEPS_PER_FLAP);
     if (steps > 0) delta += steps;
     
+    stepper.enableOutputs();
     stepper.move(-1 * delta);
     while (stepper.distanceToGo() != 0) {
       stepper.run();
     }
+    stepper.disableOutputs(); // Power off coils when jog move finishes
     server.send(200, "text/plain", "Master jogged by " + (flaps > 0 ? String(flaps) + " flaps." : String(steps) + " steps."));
   } else {
     // Slave Drum (Arduino Nano over I2C)
@@ -975,8 +1009,9 @@ void handleSetHome() {
     stepper.setCurrentPosition(0);
     currentFlapPosition = 0;
     absoluteFlapCount = 0;
+    stepper.disableOutputs(); // De-energize coils
     Serial.printf("[CALIBRATION] Master Home saved: %d steps\n", masterHomeOffsetSteps);
-    server.send(200, "text/plain", "SUCCESS: Master Flap 0 saved (" + String(masterHomeOffsetSteps) + " steps).");
+    server.send(200, "text/plain", "SUCCESS: Master Blank Flap (Home) saved (" + String(masterHomeOffsetSteps) + " steps).");
   } else {
     // Slave Drum: Send 0xFC (252) to save EEPROM
     Wire.setTimeOut(30);
@@ -985,7 +1020,7 @@ void handleSetHome() {
     Wire.write((uint8_t)0);
     uint8_t err = Wire.endTransmission(true);
     if (err == 0) {
-      server.send(200, "text/plain", "SUCCESS: Slave " + String(unit) + " Home (Flap 0) saved into EEPROM.");
+      server.send(200, "text/plain", "SUCCESS: Slave " + String(unit) + " Blank Flap (Home) saved into EEPROM.");
     } else {
       server.send(200, "text/plain", "I2C Error " + String(err) + " saving to Slave " + String(unit));
     }
@@ -997,7 +1032,7 @@ void handleReHome() {
 
   if (unit == 0) {
     findHome();
-    server.send(200, "text/plain", "Master Drum re-homed to Flap 0.");
+    server.send(200, "text/plain", "Master Drum re-homed to Blank Flap (0).");
   } else {
     Wire.setTimeOut(30);
     Wire.beginTransmission((uint8_t)unit);
@@ -1005,7 +1040,7 @@ void handleReHome() {
     Wire.write((uint8_t)0);
     uint8_t err = Wire.endTransmission(true);
     if (err == 0) {
-      server.send(200, "text/plain", "Slave " + String(unit) + " re-homed to Flap 0.");
+      server.send(200, "text/plain", "Slave " + String(unit) + " re-homed to Blank Flap (0).");
     } else {
       server.send(200, "text/plain", "I2C Error " + String(err) + " re-homing Slave " + String(unit));
     }
@@ -1084,6 +1119,9 @@ void setup() {
 void loop() {
   server.handleClient();
   stepper.run(); 
+  if (stepper.distanceToGo() == 0) {
+    stepper.disableOutputs(); // Immediately de-energize coils when stationary to prevent motor heating!
+  } 
 
   unsigned long currentMillis = millis();
 
