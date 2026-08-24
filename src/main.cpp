@@ -13,11 +13,11 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.1";
+const String CURRENT_VERSION = "1.4.2";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
-// --- HARDWARE PINS (Digit 1 Local Motor & Sensor) ---
+// --- HARDWARE PINS (Right-most Local Motor & Sensor) ---
 const int motorPin1 = 13;
 const int motorPin2 = 12;
 const int motorPin3 = 14;
@@ -124,7 +124,7 @@ const char* htmlPage = R"rawliteral(
 </head>
 <body>
   <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.4.1)</p>
+  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.4.2)</p>
   
   <div class="card">
     <label>COUNTDOWN TIMER</label>
@@ -132,7 +132,7 @@ const char* htmlPage = R"rawliteral(
   </div>
 
   <div class="card">
-    <label>DIGIT 1 CURRENT FLAP</label>
+    <label>MASTER DRUM (RIGHT-MOST) CURRENT FLAP</label>
     <div id="flapDisplay" class="status-val">FLAP --</div>
   </div>
 
@@ -180,11 +180,11 @@ const char* htmlPage = R"rawliteral(
       <div class="input-group">
         <label>TARGET DRUM</label>
         <select id="flapUnitSelect">
-          <option value="0">Master Drum (Digit 1 - Local)</option>
-          <option value="1">Slave 1 (Digit 2 - I2C 0x01)</option>
-          <option value="2">Slave 2 (Digit 3 - I2C 0x02)</option>
-          <option value="3">Slave 3 (Digit 4 - I2C 0x03)</option>
-          <option value="4">Slave 4 (Digit 5 - I2C 0x04)</option>
+          <option value="0">Master Drum (Right-most - Local)</option>
+          <option value="1">Slave 1 (2nd from Right - I2C 0x01)</option>
+          <option value="2">Slave 2 (3rd from Right - I2C 0x02)</option>
+          <option value="3">Slave 3 (4th from Right - I2C 0x03)</option>
+          <option value="4">Slave 4 (5th from Right / Left-most - I2C 0x04)</option>
         </select>
       </div>
     </div>
@@ -212,11 +212,11 @@ const char* htmlPage = R"rawliteral(
       <div class="input-group">
         <label>SELECT DRUM UNIT</label>
         <select id="calUnitSelect">
-          <option value="0">Master Drum (Digit 1 - Local)</option>
-          <option value="1">Slave 1 (Digit 2 - I2C 0x01)</option>
-          <option value="2">Slave 2 (Digit 3 - I2C 0x02)</option>
-          <option value="3">Slave 3 (Digit 4 - I2C 0x03)</option>
-          <option value="4">Slave 4 (Digit 5 - I2C 0x04)</option>
+          <option value="0">Master Drum (Right-most - Local)</option>
+          <option value="1">Slave 1 (2nd from Right - I2C 0x01)</option>
+          <option value="2">Slave 2 (3rd from Right - I2C 0x02)</option>
+          <option value="3">Slave 3 (4th from Right - I2C 0x03)</option>
+          <option value="4">Slave 4 (5th from Right / Left-most - I2C 0x04)</option>
         </select>
       </div>
     </div>
