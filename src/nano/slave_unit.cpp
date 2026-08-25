@@ -102,9 +102,7 @@ void calibrate(bool initialCalibration) {
   }
 
   currentlyrotating = 0;
-  if (initialCalibration) {
-    stepper.disableOutputs(); // Cut coil power to stay cool
-  }
+  stepper.disableOutputs(); // Always de-energize coils to stay completely cool!
 }
 
 // Move to specified flap index with high torque & smooth acceleration
@@ -177,6 +175,11 @@ void setup() {
   Wire.onRequest(requestEvent);
 
   getOffset();
+
+  // Stagger startup calibration by address to prevent simultaneous motor inrush current
+  if (i2cAddress > 1) {
+    delay((unsigned long)(i2cAddress - 1) * 2500);
+  }
   calibrate(true);
 }
 
