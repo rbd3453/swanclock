@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.2";
+const String CURRENT_VERSION = "1.4.3";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -39,7 +39,7 @@ DFRobotDFPlayerMini dfPlayer;
 bool dfPlayerReady = false;
 int currentVolume = 20;
 
-// --- MOTOR CONFIGURATION ---
+// --- MOTOR CONFIGURATION (Master Drum - Right-most) ---
 AccelStepper stepper(AccelStepper::HALF4WIRE, motorPin1, motorPin3, motorPin2, motorPin4);
 
 const int STEPS_PER_REV = 4096; // Standard 1/64 reduction
@@ -49,6 +49,14 @@ const float STEPS_PER_FLAP = (float)STEPS_PER_REV / (float)TOTAL_FLAPS; // 91.02
 bool isHome = false;
 int currentFlapPosition = 0;
 long absoluteFlapCount = 0; // Tracks total lifetime flaps to eliminate math drift
+
+// --- DRUM ARRAY TRACKING (5 DRUMS, LEFT TO RIGHT) ---
+// Drum 0: Left-most (Slave 4 - I2C 0x04)
+// Drum 1: 2nd from Left (Slave 3 - I2C 0x03)
+// Drum 2: 3rd from Left (Slave 2 - I2C 0x02)
+// Drum 3: 4th from Left / 2nd from Right (Slave 1 - I2C 0x01)
+// Drum 4: Right-most (Master Drum - Local ESP32)
+int drumFlapState[5] = {0, 0, 0, 0, 0};
 
 // --- CALIBRATION STORAGE (NVS PREFERENCES) ---
 Preferences prefs;
@@ -92,439 +100,28 @@ void logOTA(const String& msg) {
   }
 }
 
-// --- HTML & JAVASCRIPT DEBUG DASHBOARD ---
-const char* htmlPage = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { background-color: #0b0b0b; color: #00ff66; font-family: monospace; text-align: center; padding-top: 3vh; }
-    h1 { font-size: 22px; letter-spacing: 2px; margin-bottom: 5px; }
-    .card { background: #141414; border: 1px solid #00ff66; border-radius: 8px; padding: 15px; margin: 12px auto; width: 85%; max-width: 400px; box-shadow: 0 0 10px rgba(0,255,102,0.1); }
-    .status-val { font-size: 24px; font-weight: bold; color: #ffffff; letter-spacing: 1px; margin-top: 5px; }
-    button { background-color: #222; color: #00ff66; border: 2px solid #00ff66; padding: 12px 20px; font-size: 16px; font-family: monospace; cursor: pointer; border-radius: 6px; margin: 5px 0; width: 100%; font-weight: bold; }
-    button:active { background-color: #00ff66; color: #000; }
-    .btn-exec { background-color: #003311; font-size: 20px; padding: 15px; }
-    .btn-pause { background-color: #332200; border-color: #ffaa00; color: #ffaa00; }
-    .btn-ota { background-color: #001a33; border-color: #00ccff; color: #00ccff; }
-    .btn-audio-play { background-color: #260026; border-color: #ff00ff; color: #ff00ff; }
-    .btn-audio-stop { background-color: #260000; border-color: #ff3333; color: #ff3333; }
-    input[type="number"], select { background: #000; border: 1px solid #00ff66; color: #00ff66; padding: 10px; font-size: 16px; font-family: monospace; text-align: center; width: 80%; border-radius: 4px; margin-bottom: 10px; box-sizing: border-box; }
-    input[type="range"] { width: 90%; margin: 15px 0; accent-color: #00ff66; cursor: pointer; }
-    label { display: block; font-size: 12px; margin-bottom: 5px; color: #88ffbb; letter-spacing: 1px; }
-    .input-row { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .input-group { flex: 1; }
-    .input-group input, .input-group select { width: 100%; }
-    .ota-status { font-size: 12px; margin-top: 8px; color: #88ffbb; min-height: 16px; }
-    .console-box { background: #000; border: 1px solid #00ccff; color: #00ccff; height: 130px; overflow-y: scroll; font-size: 11px; padding: 8px; border-radius: 4px; margin-top: 6px; text-align: left; white-space: pre-wrap; word-break: break-all; font-family: monospace; }
-    .progress-bar-bg { background: #002233; border: 1px solid #00ccff; border-radius: 4px; height: 16px; overflow: hidden; margin: 8px 0; }
-    .progress-bar-fill { background: #00ccff; height: 100%; width: 0%; transition: width 0.3s ease; }
-  </style>
-</head>
-<body>
-  <h1>SWAN STATION TERMINAL</h1>
-  <p style="color: #666; font-size: 11px;">LIVE SYSTEM DIAGNOSTICS (v1.4.2)</p>
-  
-  <div class="card">
-    <label>COUNTDOWN TIMER</label>
-    <div id="timerDisplay" class="status-val">--:--</div>
-  </div>
+// --- CHARACTER TO FLAP TRANSLATION ---
+int charToFlap(char c) {
+  if (c >= '0' && c <= '9') {
+    return 30 + (c - '0'); // Flaps 30 to 39
+  }
+  if (c >= 'a' && c <= 'z') {
+    c = c - 'a' + 'A';
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return 1 + (c - 'A'); // Flaps 1 to 26
+  }
+  if (c == '?') return 27;
+  if (c == '!') return 28;
+  if (c == '-' || c == '.') return 29;
+  if (c == ' ') return 0; // Blank flap
+  if (c == '*' || c == '#') return 40; // Hieroglyphs
+  return 0; // Default to blank
+}
 
-  <div class="card">
-    <label>MASTER DRUM (RIGHT-MOST) CURRENT FLAP</label>
-    <div id="flapDisplay" class="status-val">FLAP --</div>
-  </div>
-
-  <div class="card">
-    <button class="btn-exec" onclick="sendCmd('/execute')">EXECUTE (RESET 108)</button>
-  </div>
-
-  <div class="card">
-    <button class="btn-pause" onclick="sendCmd('/togglePause')">PAUSE / RESUME</button>
-  </div>
-
-  <div class="card">
-    <label>AUDIO SYSTEM (DFPLAYER MP3)</label>
-    <div id="audioSdStatus" style="font-size: 11px; color: #88ffbb; margin-bottom: 10px;">QUERYING SD CARD...</div>
-    <div class="input-row">
-      <div class="input-group">
-        <label>DETECTED TRACKS</label>
-        <select id="trackSelect" onchange="syncTrackInput()">
-          <option value="1">Track 1</option>
-        </select>
-      </div>
-      <div class="input-group">
-        <label>CUSTOM #</label>
-        <input type="number" id="trackInput" min="1" max="999" value="1" onchange="syncTrackSelect()">
-      </div>
-    </div>
-    <button class="btn-audio-play" onclick="playTrack()">PLAY SOUND TRACK</button>
-    <button class="btn-audio-stop" onclick="stopAudio()">STOP SOUND</button>
-    
-    <label style="margin-top: 15px;">AUDIO VOLUME (LIVE DIAL SYNC)</label>
-    <span style="font-size: 12px; color:#fff;" id="volumeLabel">20 / 30</span>
-    <input type="range" id="volumeSlider" min="0" max="30" step="1" value="20" oninput="onSliderInput()" onchange="submitVolume()">
-    <div id="audioStatus" class="ota-status" style="color: #ff88ff;"></div>
-  </div>
-
-  <div class="card">
-    <label>MOTOR SPEED CONTROL</label>
-    <span style="font-size: 12px; color:#fff;" id="speedLabel">800 Steps/Sec</span>
-    <input type="range" id="speedSlider" min="300" max="1000" step="50" value="800" onchange="submitSpeed()">
-  </div>
-
-  <div class="card">
-    <label>MANUAL FLAP CONTROL</label>
-    <div class="input-row">
-      <div class="input-group">
-        <label>TARGET DRUM</label>
-        <select id="flapUnitSelect">
-          <option value="0">Master Drum (Right-most - Local)</option>
-          <option value="1">Slave 1 (2nd from Right - I2C 0x01)</option>
-          <option value="2">Slave 2 (3rd from Right - I2C 0x02)</option>
-          <option value="3">Slave 3 (4th from Right - I2C 0x03)</option>
-          <option value="4">Slave 4 (5th from Right / Left-most - I2C 0x04)</option>
-        </select>
-      </div>
-    </div>
-    <div class="input-row" style="margin-top: 6px;">
-      <div class="input-group">
-        <label>TARGET FLAP (0-44)</label>
-        <input type="number" id="flapInput" min="0" max="44" value="1">
-      </div>
-      <div class="input-group">
-        <label>EXTRA ROTATIONS</label>
-        <input type="number" id="rotationsInput" min="0" max="10" value="0">
-      </div>
-    </div>
-    <button onclick="submitFlap()">SET POSITION (AUTO-PAUSES TIMER)</button>
-    <div id="flapControlStatus" class="ota-status" style="color: #ff88ff; margin-top: 4px;"></div>
-  </div>
-
-  <div class="card">
-    <label>DRUM ZERO CALIBRATION TOOL</label>
-    <p style="font-size: 11px; color: #88ffbb; margin-top: 2px; margin-bottom: 8px;">
-      Jog drum until visible flap is the <b>BLANK FLAP</b> (Home baseline), then click <b>SET AS HOME (BLANK FLAP)</b>.
-    </p>
-    
-    <div class="input-row">
-      <div class="input-group">
-        <label>SELECT DRUM UNIT</label>
-        <select id="calUnitSelect">
-          <option value="0">Master Drum (Right-most - Local)</option>
-          <option value="1">Slave 1 (2nd from Right - I2C 0x01)</option>
-          <option value="2">Slave 2 (3rd from Right - I2C 0x02)</option>
-          <option value="3">Slave 3 (4th from Right - I2C 0x03)</option>
-          <option value="4">Slave 4 (5th from Right / Left-most - I2C 0x04)</option>
-        </select>
-      </div>
-    </div>
-
-    <label style="margin-top: 6px;">STEPPING & JOG CONTROLS</label>
-    <div class="input-row">
-      <button style="flex:1; padding: 10px 5px; font-size: 13px;" onclick="jogFlaps(1)">+1 FLAP</button>
-      <button style="flex:1; padding: 10px 5px; font-size: 13px;" onclick="jogFlaps(5)">+5 FLAPS</button>
-      <button style="flex:1; padding: 10px 5px; font-size: 13px;" onclick="jogFlaps(10)">+10 FLAPS</button>
-    </div>
-    <div class="input-row" style="margin-top: 5px;">
-      <button style="flex:1; padding: 8px 5px; font-size: 12px; border-color: #88ffbb; color: #88ffbb;" onclick="jogSteps(10)">+10 STEPS (FINE TUNE)</button>
-    </div>
-
-    <button style="background-color: #00441b; border-color: #00ff66; margin-top: 10px; padding: 12px;" onclick="setAsHome()">SET CURRENT POSITION AS HOME (BLANK FLAP)</button>
-    <button style="background-color: #002244; border-color: #00ccff; color: #00ccff; margin-top: 4px; padding: 8px; font-size: 12px;" onclick="reHomeDrum()">RE-HOME & VERIFY ALIGNMENT</button>
-    
-    <div id="calStatus" class="ota-status" style="color: #ffff88; margin-top: 6px;"></div>
-  </div>
-
-  <div class="card">
-    <label>I2C BUS DIAGNOSTICS & SLAVE SCANNER</label>
-    <button class="btn-ota" id="btnScanI2C" onclick="runI2CScan()">SCAN I2C BUS (0x01 - 0x77)</button>
-    <pre id="i2cScanResults" class="console-box" style="height: 90px; color: #88ffbb; border-color: #00ff66;">[SYSTEM] Ready to scan I2C bus.</pre>
-    
-    <div class="input-row" style="margin-top: 10px;">
-      <div class="input-group">
-        <label>TEST SLAVE ADDR</label>
-        <input type="number" id="testSlaveAddr" min="1" max="127" value="1">
-      </div>
-      <div class="input-group">
-        <label>TEST FLAP (0-44)</label>
-        <input type="number" id="testSlaveFlap" min="0" max="44" value="1">
-      </div>
-    </div>
-    <button onclick="testSlaveDrum()">SEND SINGLE TEST FLAP</button>
-    <div id="testSlaveStatus" class="ota-status" style="color: #ff88ff;"></div>
-  </div>
-
-  <div class="card">
-    <label>FIRMWARE MANAGEMENT & OTA TERMINAL</label>
-    <button class="btn-ota" id="btnOta" onclick="checkUpdate()">CHECK FOR FIRMWARE UPDATES</button>
-    
-    <div id="otaProgressContainer" style="display:none;">
-      <div class="progress-bar-bg">
-        <div id="otaProgressBar" class="progress-bar-fill"></div>
-      </div>
-    </div>
-
-    <div style="text-align: left; margin-top: 8px;">
-      <label>LIVE OTA SERIAL LOGS</label>
-      <pre id="otaConsole" class="console-box">[SYSTEM] Ready for firmware operations.</pre>
-    </div>
-  </div>
-
-  <script>
-    function sendCmd(url) {
-      fetch(url).catch(err => console.log(err));
-    }
-    
-    function submitFlap() {
-      let unit = document.getElementById('flapUnitSelect').value;
-      let val = document.getElementById('flapInput').value;
-      let rot = document.getElementById('rotationsInput').value;
-      let statusEl = document.getElementById('flapControlStatus');
-      statusEl.innerText = "Setting Drum " + unit + " to Flap " + val + "...";
-      fetch('/setFlap?unit=' + unit + '&val=' + val + '&rot=' + rot)
-        .then(res => res.text())
-        .then(msg => { statusEl.innerText = msg; })
-        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
-    }
-
-    function submitSpeed() {
-      let val = document.getElementById('speedSlider').value;
-      document.getElementById('speedLabel').innerText = val + " Steps/Sec";
-      fetch('/setSpeed?val=' + val).catch(err => console.log(err));
-    }
-
-    function jogFlaps(flaps) {
-      let unit = document.getElementById('calUnitSelect').value;
-      let statusEl = document.getElementById('calStatus');
-      statusEl.innerText = "Jogging Drum " + unit + " by +" + flaps + " flaps...";
-      fetch('/calibrateJog?unit=' + unit + '&flaps=' + flaps)
-        .then(res => res.text())
-        .then(msg => { statusEl.innerText = msg; })
-        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
-    }
-
-    function jogSteps(steps) {
-      let unit = document.getElementById('calUnitSelect').value;
-      let statusEl = document.getElementById('calStatus');
-      statusEl.innerText = "Jogging Drum " + unit + " by +" + steps + " steps...";
-      fetch('/calibrateJog?unit=' + unit + '&steps=' + steps)
-        .then(res => res.text())
-        .then(msg => { statusEl.innerText = msg; })
-        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
-    }
-
-    function setAsHome() {
-      let unit = document.getElementById('calUnitSelect').value;
-      let statusEl = document.getElementById('calStatus');
-      statusEl.innerText = "Saving Flap 0 Home Position for Drum " + unit + "...";
-      fetch('/setHome?unit=' + unit)
-        .then(res => res.text())
-        .then(msg => { statusEl.innerText = msg; })
-        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
-    }
-
-    function reHomeDrum() {
-      let unit = document.getElementById('calUnitSelect').value;
-      let statusEl = document.getElementById('calStatus');
-      statusEl.innerText = "Re-homing Drum " + unit + "...";
-      fetch('/reHome?unit=' + unit)
-        .then(res => res.text())
-        .then(msg => { statusEl.innerText = msg; })
-        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
-    }
-
-    function runI2CScan() {
-      let resEl = document.getElementById('i2cScanResults');
-      resEl.innerText = "[I2C] Scanning bus addresses 0x01 to 0x77...";
-      fetch('/scanI2C')
-        .then(res => res.json())
-        .then(data => {
-          resEl.innerText = data.logs;
-        })
-        .catch(err => {
-          resEl.innerText = "[ERROR] I2C Scan request failed: " + err;
-        });
-    }
-
-    function testSlaveDrum() {
-      let addr = document.getElementById('testSlaveAddr').value;
-      let flap = document.getElementById('testSlaveFlap').value;
-      let statusEl = document.getElementById('testSlaveStatus');
-      statusEl.innerText = "Sending to Slave 0x" + Number(addr).toString(16).toUpperCase() + "...";
-      fetch('/testSlave?addr=' + addr + '&flap=' + flap)
-        .then(res => res.text())
-        .then(msg => { statusEl.innerText = msg; })
-        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
-    }
-
-    let otaPollInterval = null;
-
-    function checkUpdate() {
-      document.getElementById('btnOta').disabled = true;
-      document.getElementById('btnOta').innerText = "CHECKING IN BACKGROUND...";
-      fetch('/check-update')
-        .then(res => res.text())
-        .then(msg => {
-          startOtaPolling();
-        })
-        .catch(err => {
-          console.log(err);
-          document.getElementById('btnOta').disabled = false;
-          document.getElementById('btnOta').innerText = "CHECK FOR FIRMWARE UPDATES";
-        });
-    }
-
-    function startOtaPolling() {
-      if (otaPollInterval) clearInterval(otaPollInterval);
-      otaPollInterval = setInterval(pollOtaStatus, 500);
-      pollOtaStatus();
-    }
-
-    function pollOtaStatus() {
-      fetch('/ota-status')
-        .then(res => res.json())
-        .then(data => {
-          let consoleEl = document.getElementById('otaConsole');
-          if (data.logs) {
-            consoleEl.innerText = data.logs;
-            consoleEl.scrollTop = consoleEl.scrollHeight;
-          }
-
-          let progressContainer = document.getElementById('otaProgressContainer');
-          let progressBar = document.getElementById('otaProgressBar');
-
-          if (data.progress >= 0) {
-            progressContainer.style.display = "block";
-            progressBar.style.width = data.progress + "%";
-          } else {
-            progressContainer.style.display = "none";
-          }
-
-          if (!data.running) {
-            document.getElementById('btnOta').disabled = false;
-            document.getElementById('btnOta').innerText = "CHECK FOR FIRMWARE UPDATES";
-            if (data.state === "SUCCESS") {
-              if (otaPollInterval) clearInterval(otaPollInterval);
-              document.getElementById('btnOta').innerText = "UPDATE COMPLETED - REBOOTING...";
-            }
-          }
-        })
-        .catch(err => console.log(err));
-    }
-
-    function playTrack() {
-      let track = document.getElementById('trackInput').value;
-      let statusDiv = document.getElementById('audioStatus');
-      statusDiv.innerText = "SENDING PLAY CMD (TRACK " + track + ")...";
-      fetch('/playTrack?track=' + track)
-        .then(res => res.text())
-        .then(msg => { statusDiv.innerText = msg; })
-        .catch(err => { statusDiv.innerText = "AUDIO CMD FAILED"; console.log(err); });
-    }
-
-    function stopAudio() {
-      let statusDiv = document.getElementById('audioStatus');
-      statusDiv.innerText = "STOPPING AUDIO...";
-      fetch('/stopAudio')
-        .then(res => res.text())
-        .then(msg => { statusDiv.innerText = msg; })
-        .catch(err => { statusDiv.innerText = "STOP CMD FAILED"; console.log(err); });
-    }
-
-    let isUserInteractingSlider = false;
-
-    function onSliderInput() {
-      isUserInteractingSlider = true;
-      let val = document.getElementById('volumeSlider').value;
-      document.getElementById('volumeLabel').innerText = val + " / 30";
-    }
-
-    function submitVolume() {
-      let val = document.getElementById('volumeSlider').value;
-      document.getElementById('volumeLabel').innerText = val + " / 30";
-      fetch('/setVolume?val=' + val)
-        .then(res => res.text())
-        .then(msg => { 
-          document.getElementById('audioStatus').innerText = msg; 
-          setTimeout(() => { isUserInteractingSlider = false; }, 300);
-        })
-        .catch(err => {
-          console.log(err);
-          isUserInteractingSlider = false;
-        });
-    }
-
-    function syncTrackInput() {
-      document.getElementById('trackInput').value = document.getElementById('trackSelect').value;
-    }
-
-    function syncTrackSelect() {
-      let val = document.getElementById('trackInput').value;
-      let sel = document.getElementById('trackSelect');
-      sel.value = val;
-    }
-
-    function loadAudioInfo() {
-      fetch('/getAudioInfo')
-        .then(res => res.json())
-        .then(data => {
-          let sdStatus = document.getElementById('audioSdStatus');
-          let sel = document.getElementById('trackSelect');
-          if (data.trackCount > 0) {
-            sdStatus.innerText = "SD CARD DETECTED (" + data.trackCount + " TRACKS FOUND)";
-            sel.innerHTML = "";
-            for (let i = 1; i <= data.trackCount; i++) {
-              let opt = document.createElement('option');
-              opt.value = i;
-              opt.innerText = "Track " + i;
-              sel.appendChild(opt);
-            }
-          } else {
-            sdStatus.innerText = "SD CARD READY (DIRECT TRACK ACCESS)";
-          }
-          if (data.volume !== undefined && !isUserInteractingSlider) {
-            document.getElementById('volumeSlider').value = data.volume;
-            document.getElementById('volumeLabel').innerText = data.volume + " / 30";
-          }
-        })
-        .catch(err => console.log(err));
-    }
-
-    let sliderEl = document.getElementById('volumeSlider');
-    sliderEl.addEventListener('mousedown', () => { isUserInteractingSlider = true; });
-    sliderEl.addEventListener('touchstart', () => { isUserInteractingSlider = true; });
-    sliderEl.addEventListener('mouseup', () => { isUserInteractingSlider = false; });
-    sliderEl.addEventListener('touchend', () => { isUserInteractingSlider = false; });
-
-    loadAudioInfo();
-    pollOtaStatus();
-
-    // Fast 200ms status poll for live volume knob & countdown tracking
-    setInterval(() => {
-      fetch('/status')
-        .then(res => res.json())
-        .then(data => {
-          document.getElementById('timerDisplay').innerText = data.timer;
-          document.getElementById('flapDisplay').innerText = "FLAP " + data.flap;
-          if (data.volume !== undefined && !isUserInteractingSlider) {
-            document.getElementById('volumeSlider').value = data.volume;
-            document.getElementById('volumeLabel').innerText = data.volume + " / 30";
-          }
-        })
-        .catch(err => console.log(err));
-    }, 200);
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// --- DRIFT-FREE FLAP MATH WITH EXTRA ROTATIONS ---
+// --- DRIFT-FREE FLAP MATH WITH COIL POWER MANAGEMENT ---
 void goToFlap(int targetFlap, int extraRotations = 0) {
   if (targetFlap < 0 || targetFlap >= TOTAL_FLAPS) return;
-  
-  // If we are already there AND no extra rotations are requested, do nothing
   if (targetFlap == currentFlapPosition && extraRotations == 0) return; 
   
   int flapsToAdvance = targetFlap - currentFlapPosition;
@@ -532,16 +129,35 @@ void goToFlap(int targetFlap, int extraRotations = 0) {
     flapsToAdvance += TOTAL_FLAPS; 
   }
   
-  // Add the extra full rotations (45 flaps per rotation)
   int totalFlapsToMove = flapsToAdvance + (extraRotations * TOTAL_FLAPS);
-  
   absoluteFlapCount += totalFlapsToMove;
   long targetSteps = -1 * (long)(absoluteFlapCount * STEPS_PER_FLAP);
-  stepper.enableOutputs(); // Energize motor coils for motion
+  stepper.enableOutputs(); // Energize coils for motion
   stepper.moveTo(targetSteps);
-  
-  // Update internal tracker to the new resting spot
   currentFlapPosition = targetFlap;
+  drumFlapState[4] = targetFlap;
+}
+
+// Set a specific drum (0 to 4) to a flap position
+void setDrumFlap(int drumIndex, int flap, int extraRot = 0) {
+  if (drumIndex < 0 || drumIndex > 4) return;
+  if (flap < 0 || flap >= TOTAL_FLAPS) return;
+  if (drumFlapState[drumIndex] == flap && extraRot == 0) return; // Already in place
+
+  drumFlapState[drumIndex] = flap;
+
+  if (drumIndex == 4) {
+    // Drum 4: Master (Right-most)
+    goToFlap(flap, extraRot);
+  } else {
+    // Slaves: Drum 0 -> Addr 4, Drum 1 -> Addr 3, Drum 2 -> Addr 2, Drum 3 -> Addr 1
+    uint8_t slaveAddr = (uint8_t)(4 - drumIndex);
+    Wire.setTimeOut(20);
+    Wire.beginTransmission(slaveAddr);
+    Wire.write((uint8_t)flap);
+    Wire.write((uint8_t)10); // Default RPM
+    Wire.endTransmission(true);
+  }
 }
 
 void findHome() {
@@ -569,25 +185,22 @@ void findHome() {
   stepper.setCurrentPosition(0);
   currentFlapPosition = 0;
   absoluteFlapCount = 0;
-  stepper.disableOutputs(); // De-energize motor coils when stationary to prevent heating!
+  drumFlapState[4] = 0;
+  stepper.disableOutputs(); // De-energize coils when stationary
   
   Serial.printf("\n[SUCCESS] HOME LOCKED (Offset: %d steps). INDEXED TO BLANK FLAP (0).\n", masterHomeOffsetSteps);
 }
 
-// --- VERSION COMPARISON HELPER (SEMANTIC MAJOR.MINOR.PATCH) ---
+// --- VERSION COMPARISON HELPER ---
 bool isNewerVersion(const String& serverVer, const String& currentVer) {
   if (serverVer == currentVer || serverVer.length() == 0) return false;
-  
   int sMajor = 0, sMinor = 0, sPatch = 0;
   int cMajor = 0, cMinor = 0, cPatch = 0;
-  
   sscanf(serverVer.c_str(), "%d.%d.%d", &sMajor, &sMinor, &sPatch);
   sscanf(currentVer.c_str(), "%d.%d.%d", &cMajor, &cMinor, &cPatch);
-  
   if (sMajor != cMajor) return sMajor > cMajor;
   if (sMinor != cMinor) return sMinor > cMinor;
   if (sPatch != cPatch) return sPatch > cPatch;
-  
   return false;
 }
 
@@ -601,7 +214,7 @@ void otaTaskFunction(void* pvParameters) {
   logOTA("[OTA] Connecting to GitHub manifest...");
 
   WiFiClientSecure client;
-  client.setInsecure(); // Critical: GitHub rotates SSL certificates
+  client.setInsecure();
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -739,9 +352,522 @@ void otaTaskFunction(void* pvParameters) {
   vTaskDelete(NULL);
 }
 
+// ==========================================
+// --- HTML: MAIN COUNTDOWN & 5-DRUM PAGE ---
+// ==========================================
+const char* mainPageHtml = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Swan Station Terminal</title>
+  <style>
+    body { background-color: #0b0b0b; color: #00ff66; font-family: 'Courier New', monospace; text-align: center; margin: 0; padding: 20px 10px; }
+    .container { max-width: 480px; margin: 0 auto; }
+    .header-bar { display: flex; justify-content: space-between; align-items: center; padding: 0 5px 15px 5px; border-bottom: 1px solid #1a3322; }
+    .title-box { text-align: left; }
+    h1 { font-size: 20px; letter-spacing: 2px; margin: 0; color: #00ff66; text-shadow: 0 0 6px rgba(0,255,102,0.4); }
+    .subtitle { color: #557766; font-size: 11px; margin-top: 3px; }
+    .gear-btn { font-size: 22px; text-decoration: none; color: #00ccff; padding: 6px 10px; border: 1px solid #005577; border-radius: 6px; background: #001a26; transition: 0.2s; }
+    .gear-btn:hover { background: #00334d; border-color: #00ccff; }
+    .card { background: #141414; border: 1px solid #1a3322; border-radius: 8px; padding: 16px; margin: 15px 0; box-shadow: 0 0 12px rgba(0,0,0,0.8); }
+    .timer-val { font-size: 48px; font-weight: bold; color: #ffffff; letter-spacing: 4px; text-shadow: 0 0 10px rgba(255,255,255,0.4); margin: 8px 0; }
+    
+    /* 5-DRUM SPLIT FLAP STYLING */
+    .split-flap-container { display: flex; justify-content: center; align-items: center; gap: 6px; margin: 15px 0 10px 0; }
+    .flap-unit { display: flex; flex-direction: column; align-items: center; }
+    .flap-unit label { font-size: 9px; color: #668877; margin-bottom: 3px; }
+    .flap-box { width: 52px; height: 68px; background: #000; border: 2px solid #00ff66; border-radius: 6px; color: #ffffff; font-size: 34px; font-weight: bold; font-family: monospace; text-align: center; line-height: 68px; box-shadow: inset 0 0 8px rgba(0,255,102,0.2), 0 0 8px rgba(0,0,0,0.8); position: relative; box-sizing: border-box; text-transform: uppercase; }
+    .flap-box::before { content: ""; position: absolute; top: 50%; left: 0; right: 0; height: 2px; background: #111; pointer-events: none; }
+    .flap-colon { font-size: 36px; font-weight: bold; color: #00ff66; margin-top: 14px; }
+    
+    button { background-color: #1a1a1a; color: #00ff66; border: 2px solid #00ff66; padding: 12px 18px; font-size: 15px; font-family: monospace; cursor: pointer; border-radius: 6px; margin: 6px 0; width: 100%; font-weight: bold; transition: 0.15s; }
+    button:active { background-color: #00ff66; color: #000; }
+    .btn-exec { background-color: #003311; font-size: 17px; padding: 14px; border-color: #00ff66; }
+    .btn-pause { background-color: #332200; border-color: #ffaa00; color: #ffaa00; }
+    .btn-submit-flaps { background-color: #002b3d; border-color: #00ccff; color: #00ccff; margin-top: 10px; }
+    
+    .input-row { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .input-group { flex: 1; }
+    .input-group label { display: block; font-size: 11px; margin-bottom: 4px; color: #88ffbb; }
+    .input-group input { width: 100%; background: #000; border: 1px solid #00ff66; color: #00ff66; padding: 10px; font-size: 18px; font-family: monospace; text-align: center; border-radius: 4px; box-sizing: border-box; }
+    .status-msg { font-size: 12px; color: #88ffbb; min-height: 18px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-bar">
+      <div class="title-box">
+        <h1>SWAN STATION</h1>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.3)</div>
+      </div>
+      <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
+    </div>
+
+    <!-- MAIN TIMER DISPLAY CARD -->
+    <div class="card">
+      <div style="font-size: 12px; color: #88ffbb; letter-spacing: 1px;">COUNTDOWN TIMER</div>
+      <div id="timerDisplay" class="timer-val">108:00</div>
+      <div id="statusSubtext" style="font-size: 12px; color: #888;">COUNTING DOWN</div>
+      
+      <div style="display:flex; gap:10px; margin-top:12px;">
+        <button class="btn-exec" style="flex:1;" onclick="sendCmd('/execute')">RESET (108)</button>
+        <button class="btn-pause" style="flex:1;" id="pauseBtn" onclick="sendCmd('/togglePause')">PAUSE</button>
+      </div>
+    </div>
+
+    <!-- 5-DRUM MANUAL SPLIT FLAP INTERFACE -->
+    <div class="card">
+      <div style="font-size: 12px; color: #88ffbb; letter-spacing: 1px;">SPLIT-FLAP DIGIT OVERRIDE</div>
+      <div style="font-size: 11px; color: #666; margin-top: 2px;">Enter digits, letters, or symbols (Left ➔ Right)</div>
+      
+      <div class="split-flap-container">
+        <div class="flap-unit">
+          <label>D1 (MIN 100)</label>
+          <input type="text" maxlength="2" id="drum0" class="flap-box" value="1" onclick="this.select()">
+        </div>
+        <div class="flap-unit">
+          <label>D2 (MIN 10)</label>
+          <input type="text" maxlength="2" id="drum1" class="flap-box" value="0" onclick="this.select()">
+        </div>
+        <div class="flap-unit">
+          <label>D3 (MIN 1)</label>
+          <input type="text" maxlength="2" id="drum2" class="flap-box" value="8" onclick="this.select()">
+        </div>
+        <div class="flap-colon">:</div>
+        <div class="flap-unit">
+          <label>D4 (SEC 10)</label>
+          <input type="text" maxlength="2" id="drum3" class="flap-box" value="0" onclick="this.select()">
+        </div>
+        <div class="flap-unit">
+          <label>D5 (MASTER)</label>
+          <input type="text" maxlength="2" id="drum4" class="flap-box" value="0" onclick="this.select()">
+        </div>
+      </div>
+      
+      <button class="btn-submit-flaps" onclick="submit5Drums()">DISPLAY ON PHYSICAL DRUMS</button>
+      <div id="drumCmdStatus" class="status-msg" style="color: #00ccff;"></div>
+    </div>
+
+    <!-- CUSTOM COUNTDOWN STARTER -->
+    <div class="card">
+      <div style="font-size: 12px; color: #88ffbb; letter-spacing: 1px; margin-bottom: 8px;">CUSTOM COUNTDOWN START</div>
+      <div class="input-row">
+        <div class="input-group">
+          <label>MINUTES (0-999)</label>
+          <input type="number" id="startMin" min="0" max="999" value="108">
+        </div>
+        <div class="input-group">
+          <label>SECONDS (0-59)</label>
+          <input type="number" id="startSec" min="0" max="59" value="0">
+        </div>
+      </div>
+      <button class="btn-exec" onclick="startCustomTimer()">START NEW COUNTDOWN</button>
+    </div>
+  </div>
+
+  <script>
+    function sendCmd(url) {
+      fetch(url).catch(err => console.log(err));
+    }
+
+    function submit5Drums() {
+      let d0 = document.getElementById('drum0').value;
+      let d1 = document.getElementById('drum1').value;
+      let d2 = document.getElementById('drum2').value;
+      let d3 = document.getElementById('drum3').value;
+      let d4 = document.getElementById('drum4').value;
+      let statusEl = document.getElementById('drumCmdStatus');
+      statusEl.innerText = "Dispatching [" + d0 + " " + d1 + " " + d2 + " : " + d3 + " " + d4 + "] to drums...";
+      
+      fetch('/setCustomFlaps?d0=' + encodeURIComponent(d0) + '&d1=' + encodeURIComponent(d1) + '&d2=' + encodeURIComponent(d2) + '&d3=' + encodeURIComponent(d3) + '&d4=' + encodeURIComponent(d4))
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function startCustomTimer() {
+      let m = document.getElementById('startMin').value;
+      let s = document.getElementById('startSec').value;
+      fetch('/startCountdown?min=' + m + '&sec=' + s)
+        .then(res => res.text())
+        .catch(err => console.log(err));
+    }
+
+    // Fast 200ms status poll
+    setInterval(() => {
+      fetch('/status')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('timerDisplay').innerText = data.timer;
+          document.getElementById('pauseBtn').innerText = data.paused ? "RESUME" : "PAUSE";
+          document.getElementById('statusSubtext').innerText = data.paused ? "TIMER PAUSED" : "COUNTING DOWN";
+        })
+        .catch(err => console.log(err));
+    }, 200);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ===============================================
+// --- HTML: SETTINGS & DIAGNOSTICS PAGE (/diagnostics) ---
+// ===============================================
+const char* diagnosticsPageHtml = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Swan Station Diagnostics</title>
+  <style>
+    body { background-color: #0b0b0b; color: #00ff66; font-family: 'Courier New', monospace; text-align: center; margin: 0; padding: 20px 10px; }
+    .container { max-width: 480px; margin: 0 auto; }
+    .header-bar { display: flex; justify-content: space-between; align-items: center; padding: 0 5px 15px 5px; border-bottom: 1px solid #1a3322; }
+    .title-box { text-align: left; }
+    h1 { font-size: 19px; letter-spacing: 2px; margin: 0; color: #00ccff; }
+    .back-btn { font-size: 13px; text-decoration: none; color: #00ff66; padding: 6px 12px; border: 1px solid #00ff66; border-radius: 6px; background: #002211; font-weight: bold; transition: 0.15s; }
+    .back-btn:hover { background: #004422; }
+    .card { background: #141414; border: 1px solid #005577; border-radius: 8px; padding: 15px; margin: 14px 0; text-align: left; box-shadow: 0 0 10px rgba(0,0,0,0.8); }
+    .card label { display: block; font-size: 12px; margin-bottom: 6px; color: #00ccff; font-weight: bold; letter-spacing: 1px; }
+    button { background-color: #1a1a1a; color: #00ff66; border: 1px solid #00ff66; padding: 10px 16px; font-size: 14px; font-family: monospace; cursor: pointer; border-radius: 6px; margin: 5px 0; width: 100%; font-weight: bold; }
+    button:active { background-color: #00ff66; color: #000; }
+    .btn-ota { background-color: #001a33; border-color: #00ccff; color: #00ccff; padding: 12px; }
+    .btn-audio-play { background-color: #260026; border-color: #ff00ff; color: #ff00ff; }
+    .btn-audio-stop { background-color: #260000; border-color: #ff3333; color: #ff3333; }
+    input[type="number"], select { background: #000; border: 1px solid #00ccff; color: #00ccff; padding: 9px; font-size: 15px; font-family: monospace; text-align: center; width: 100%; border-radius: 4px; margin-bottom: 8px; box-sizing: border-box; }
+    input[type="range"] { width: 100%; margin: 12px 0; accent-color: #00ccff; cursor: pointer; }
+    .input-row { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .input-group { flex: 1; }
+    .ota-status { font-size: 11px; margin-top: 6px; color: #88ffbb; min-height: 16px; }
+    .console-box { background: #000; border: 1px solid #00ccff; color: #00ccff; height: 110px; overflow-y: scroll; font-size: 11px; padding: 8px; border-radius: 4px; margin-top: 6px; text-align: left; white-space: pre-wrap; word-break: break-all; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-bar">
+      <div class="title-box">
+        <h1>SETTINGS & CALIBRATION</h1>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.3)</div>
+      </div>
+      <a href="/" class="back-btn">← TERMINAL</a>
+    </div>
+
+    <!-- DRUM ZERO CALIBRATION TOOL -->
+    <div class="card" style="border-color: #00ff66;">
+      <label style="color:#00ff66;">DRUM ZERO CALIBRATION TOOL</label>
+      <div style="font-size: 11px; color: #88ffbb; margin-bottom: 8px;">
+        Jog drum until visible flap is the <b>BLANK FLAP</b> (Home baseline), then click <b>SET AS HOME (BLANK FLAP)</b>.
+      </div>
+      
+      <div class="input-group">
+        <label>TARGET DRUM</label>
+        <select id="calUnitSelect">
+          <option value="0">Master Drum (Right-most - Local)</option>
+          <option value="1">Slave 1 (2nd from Right - I2C 0x01)</option>
+          <option value="2">Slave 2 (3rd from Right - I2C 0x02)</option>
+          <option value="3">Slave 3 (4th from Right - I2C 0x03)</option>
+          <option value="4">Slave 4 (5th from Right / Left-most - I2C 0x04)</option>
+        </select>
+      </div>
+
+      <label style="margin-top: 8px;">JOG STEPS & FLAPS</label>
+      <div class="input-row">
+        <button style="flex:1;" onclick="jogFlaps(1)">+1 FLAP</button>
+        <button style="flex:1;" onclick="jogFlaps(5)">+5 FLAPS</button>
+        <button style="flex:1;" onclick="jogFlaps(10)">+10 FLAPS</button>
+      </div>
+      <div class="input-row">
+        <button style="flex:1; font-size: 12px;" onclick="jogSteps(10)">+10 STEPS (FINE TUNE)</button>
+      </div>
+
+      <button style="background-color: #00441b; border-color: #00ff66; color: #fff; margin-top: 8px; padding: 12px;" onclick="setAsHome()">SET CURRENT POSITION AS HOME (BLANK FLAP)</button>
+      <button style="background-color: #002244; border-color: #00ccff; color: #00ccff; font-size: 12px;" onclick="reHomeDrum()">RE-HOME & VERIFY ALIGNMENT</button>
+      <div id="calStatus" class="ota-status" style="color: #ffff88;"></div>
+    </div>
+
+    <!-- MANUAL SINGLE DRUM POSITION -->
+    <div class="card">
+      <label>MANUAL SINGLE DRUM POSITION</label>
+      <div class="input-group">
+        <label>TARGET DRUM</label>
+        <select id="flapUnitSelect">
+          <option value="0">Master Drum (Right-most - Local)</option>
+          <option value="1">Slave 1 (2nd from Right - I2C 0x01)</option>
+          <option value="2">Slave 2 (3rd from Right - I2C 0x02)</option>
+          <option value="3">Slave 3 (4th from Right - I2C 0x03)</option>
+          <option value="4">Slave 4 (5th from Right / Left-most - I2C 0x04)</option>
+        </select>
+      </div>
+      <div class="input-row">
+        <div class="input-group">
+          <label>FLAP (0-44)</label>
+          <input type="number" id="flapInput" min="0" max="44" value="1">
+        </div>
+        <div class="input-group">
+          <label>EXTRA ROTATIONS</label>
+          <input type="number" id="rotationsInput" min="0" max="10" value="0">
+        </div>
+      </div>
+      <button onclick="submitSingleFlap()">MOVE DRUM TO FLAP</button>
+      <div id="flapControlStatus" class="ota-status" style="color: #ff88ff;"></div>
+    </div>
+
+    <!-- I2C BUS DIAGNOSTICS & SLAVE SCANNER -->
+    <div class="card">
+      <label>I2C BUS DIAGNOSTICS & SLAVE SCANNER</label>
+      <button class="btn-ota" onclick="runI2CScan()">SCAN I2C BUS (0x01 - 0x77)</button>
+      <pre id="i2cScanResults" class="console-box" style="color: #88ffbb; border-color: #00ff66;">Ready to scan I2C bus.</pre>
+    </div>
+
+    <!-- MOTOR SPEED CONTROL -->
+    <div class="card">
+      <label>MOTOR SPEED CONTROL</label>
+      <div style="display:flex; justify-content:space-between; font-size:12px; color:#fff;">
+        <span>Speed</span><span id="speedLabel">800 Steps/Sec</span>
+      </div>
+      <input type="range" id="speedSlider" min="300" max="1000" step="50" value="800" onchange="submitSpeed()">
+    </div>
+
+    <!-- AUDIO SYSTEM (DFPLAYER MP3) -->
+    <div class="card">
+      <label>AUDIO SYSTEM (DFPLAYER MP3)</label>
+      <div id="audioSdStatus" style="font-size: 11px; color: #88ffbb; margin-bottom: 8px;">QUERYING SD CARD...</div>
+      <div class="input-row">
+        <div class="input-group">
+          <label>TRACK SELECT</label>
+          <select id="trackSelect" onchange="syncTrackInput()">
+            <option value="1">Track 1</option>
+          </select>
+        </div>
+        <div class="input-group">
+          <label>CUSTOM #</label>
+          <input type="number" id="trackInput" min="1" max="999" value="1" onchange="syncTrackSelect()">
+        </div>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <button class="btn-audio-play" style="flex:1;" onclick="playTrack()">PLAY TRACK</button>
+        <button class="btn-audio-stop" style="flex:1;" onclick="stopAudio()">STOP</button>
+      </div>
+      <label style="margin-top: 12px;">VOLUME (LIVE DIAL SYNC): <span id="volumeLabel" style="color:#fff;">20 / 30</span></label>
+      <input type="range" id="volumeSlider" min="0" max="30" step="1" value="20" oninput="onSliderInput()" onchange="submitVolume()">
+      <div id="audioStatus" class="ota-status" style="color: #ff88ff;"></div>
+    </div>
+
+    <!-- FIRMWARE MANAGEMENT & OTA TERMINAL -->
+    <div class="card">
+      <label>FIRMWARE MANAGEMENT & OTA TERMINAL</label>
+      <button class="btn-ota" id="btnOta" onclick="checkUpdate()">CHECK FOR FIRMWARE UPDATES</button>
+      <div id="otaProgressContainer" style="display:none; background:#002233; border:1px solid #00ccff; height:14px; border-radius:4px; margin:8px 0;">
+        <div id="otaProgressBar" style="background:#00ccff; height:100%; width:0%; transition:width 0.3s ease;"></div>
+      </div>
+      <label style="margin-top: 8px;">LIVE OTA SERIAL LOGS</label>
+      <pre id="otaConsole" class="console-box">[SYSTEM] Ready for firmware operations.</pre>
+    </div>
+  </div>
+
+  <script>
+    function jogFlaps(flaps) {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Jogging Drum " + unit + " by +" + flaps + " flaps...";
+      fetch('/calibrateJog?unit=' + unit + '&flaps=' + flaps)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function jogSteps(steps) {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Jogging Drum " + unit + " by +" + steps + " steps...";
+      fetch('/calibrateJog?unit=' + unit + '&steps=' + steps)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function setAsHome() {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Saving Blank Flap Home for Drum " + unit + "...";
+      fetch('/setHome?unit=' + unit)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function reHomeDrum() {
+      let unit = document.getElementById('calUnitSelect').value;
+      let statusEl = document.getElementById('calStatus');
+      statusEl.innerText = "Re-homing Drum " + unit + "...";
+      fetch('/reHome?unit=' + unit)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function submitSingleFlap() {
+      let unit = document.getElementById('flapUnitSelect').value;
+      let val = document.getElementById('flapInput').value;
+      let rot = document.getElementById('rotationsInput').value;
+      let statusEl = document.getElementById('flapControlStatus');
+      statusEl.innerText = "Moving Drum " + unit + " to Flap " + val + "...";
+      fetch('/setFlap?unit=' + unit + '&val=' + val + '&rot=' + rot)
+        .then(res => res.text())
+        .then(msg => { statusEl.innerText = msg; })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function runI2CScan() {
+      let resEl = document.getElementById('i2cScanResults');
+      resEl.innerText = "[I2C] Scanning bus addresses 0x01 to 0x77...";
+      fetch('/scanI2C')
+        .then(res => res.json())
+        .then(data => { resEl.innerText = data.logs; })
+        .catch(err => { resEl.innerText = "[ERROR] I2C Scan request failed: " + err; });
+    }
+
+    function submitSpeed() {
+      let val = document.getElementById('speedSlider').value;
+      document.getElementById('speedLabel').innerText = val + " Steps/Sec";
+      fetch('/setSpeed?val=' + val).catch(err => console.log(err));
+    }
+
+    let isUserInteractingSlider = false;
+
+    function playTrack() {
+      let track = document.getElementById('trackInput').value;
+      fetch('/playTrack?track=' + track).then(res => res.text()).then(msg => {
+        document.getElementById('audioStatus').innerText = msg;
+      });
+    }
+
+    function stopAudio() {
+      fetch('/stopAudio').then(res => res.text()).then(msg => {
+        document.getElementById('audioStatus').innerText = msg;
+      });
+    }
+
+    function onSliderInput() {
+      let val = document.getElementById('volumeSlider').value;
+      document.getElementById('volumeLabel').innerText = val + " / 30";
+    }
+
+    function submitVolume() {
+      let val = document.getElementById('volumeSlider').value;
+      fetch('/setVolume?val=' + val);
+    }
+
+    function syncTrackInput() {
+      document.getElementById('trackInput').value = document.getElementById('trackSelect').value;
+    }
+
+    function syncTrackSelect() {
+      let customVal = document.getElementById('trackInput').value;
+      let sel = document.getElementById('trackSelect');
+      for (let i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value == customVal) {
+          sel.selectedIndex = i;
+          return;
+        }
+      }
+    }
+
+    function loadAudioInfo() {
+      fetch('/getAudioInfo')
+        .then(res => res.json())
+        .then(data => {
+          let sdStatus = document.getElementById('audioSdStatus');
+          let sel = document.getElementById('trackSelect');
+          if (data.trackCount > 0) {
+            sdStatus.innerText = "SD CARD DETECTED (" + data.trackCount + " TRACKS FOUND)";
+            sel.innerHTML = "";
+            for (let i = 1; i <= data.trackCount; i++) {
+              let opt = document.createElement('option');
+              opt.value = i;
+              opt.innerText = "Track " + i;
+              sel.appendChild(opt);
+            }
+          } else {
+            sdStatus.innerText = "SD CARD READY (DIRECT TRACK ACCESS)";
+          }
+        })
+        .catch(err => console.log(err));
+    }
+
+    let otaPollInterval = null;
+    function checkUpdate() {
+      document.getElementById('btnOta').disabled = true;
+      document.getElementById('btnOta').innerText = "CHECKING IN BACKGROUND...";
+      fetch('/check-update')
+        .then(res => res.text())
+        .then(msg => { startOtaPolling(); })
+        .catch(err => {
+          document.getElementById('btnOta').disabled = false;
+          document.getElementById('btnOta').innerText = "CHECK FOR FIRMWARE UPDATES";
+        });
+    }
+
+    function startOtaPolling() {
+      if (otaPollInterval) clearInterval(otaPollInterval);
+      otaPollInterval = setInterval(pollOtaStatus, 500);
+      pollOtaStatus();
+    }
+
+    function pollOtaStatus() {
+      fetch('/ota-status')
+        .then(res => res.json())
+        .then(data => {
+          let consoleEl = document.getElementById('otaConsole');
+          if (data.logs) {
+            consoleEl.innerText = data.logs;
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+          }
+          let progressContainer = document.getElementById('otaProgressContainer');
+          let progressBar = document.getElementById('otaProgressBar');
+          let btnOta = document.getElementById('btnOta');
+
+          if (data.running) {
+            btnOta.disabled = true;
+            btnOta.innerText = "FIRMWARE FLASHING IN PROGRESS...";
+            if (data.progress >= 0) {
+              progressContainer.style.display = "block";
+              progressBar.style.width = data.progress + "%";
+            }
+          } else {
+            btnOta.disabled = false;
+            btnOta.innerText = "CHECK FOR FIRMWARE UPDATES";
+            if (data.progress === 100) {
+              progressBar.style.width = "100%";
+            }
+          }
+        })
+        .catch(err => console.log(err));
+    }
+
+    let sliderEl = document.getElementById('volumeSlider');
+    sliderEl.addEventListener('mousedown', () => { isUserInteractingSlider = true; });
+    sliderEl.addEventListener('touchstart', () => { isUserInteractingSlider = true; });
+    sliderEl.addEventListener('mouseup', () => { isUserInteractingSlider = false; });
+    sliderEl.addEventListener('touchend', () => { isUserInteractingSlider = false; });
+
+    loadAudioInfo();
+    pollOtaStatus();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ==============================
 // --- WEB SERVER ENDPOINTS ---
+// ==============================
+
 void handleRoot() {
-  server.send(200, "text/html", htmlPage);
+  server.send(200, "text/html", mainPageHtml);
+}
+
+void handleDiagnostics() {
+  server.send(200, "text/html", diagnosticsPageHtml);
 }
 
 void handleStatus() {
@@ -754,11 +880,62 @@ void handleStatus() {
 
   String json = "{";
   json += "\"timer\":\"" + String(timerBuf) + "\",";
+  json += "\"minutes\":" + String(currentMinutes) + ",";
+  json += "\"seconds\":" + String(currentSeconds) + ",";
+  json += "\"paused\":" + String(isPaused ? "true" : "false") + ",";
+  json += "\"volume\":" + String(currentVolume) + ",";
   json += "\"flap\":" + String(currentFlapPosition) + ",";
-  json += "\"volume\":" + String(currentVolume);
+  json += "\"d0\":" + String(drumFlapState[0]) + ",";
+  json += "\"d1\":" + String(drumFlapState[1]) + ",";
+  json += "\"d2\":" + String(drumFlapState[2]) + ",";
+  json += "\"d3\":" + String(drumFlapState[3]) + ",";
+  json += "\"d4\":" + String(drumFlapState[4]);
   json += "}";
 
   server.send(200, "application/json", json);
+}
+
+void handleSetCustomFlaps() {
+  isPaused = true; // Auto-pause countdown when manual flaps are commanded
+
+  String dStr[5];
+  dStr[0] = server.hasArg("d0") ? server.arg("d0") : " ";
+  dStr[1] = server.hasArg("d1") ? server.arg("d1") : " ";
+  dStr[2] = server.hasArg("d2") ? server.arg("d2") : " ";
+  dStr[3] = server.hasArg("d3") ? server.arg("d3") : " ";
+  dStr[4] = server.hasArg("d4") ? server.arg("d4") : " ";
+
+  for (int i = 0; i < 5; i++) {
+    int flap = 0;
+    dStr[i].trim();
+    if (dStr[i].length() == 0) {
+      flap = 0;
+    } else if (dStr[i].length() == 1) {
+      flap = charToFlap(dStr[i].charAt(0));
+    } else {
+      // Numerical flap index directly (e.g. "40")
+      flap = dStr[i].toInt();
+    }
+    setDrumFlap(i, flap);
+  }
+
+  Serial.printf("[MANUAL] 5-Drum Override dispatched: [%s %s %s : %s %s]\n", dStr[0].c_str(), dStr[1].c_str(), dStr[2].c_str(), dStr[3].c_str(), dStr[4].c_str());
+  server.send(200, "text/plain", "SUCCESS: Dispatched [" + dStr[0] + " " + dStr[1] + " " + dStr[2] + " : " + dStr[3] + " " + dStr[4] + "] to physical drums.");
+}
+
+void handleStartCountdown() {
+  if (server.hasArg("min") && server.hasArg("sec")) {
+    currentMinutes = server.arg("min").toInt();
+    currentSeconds = server.arg("sec").toInt();
+    if (currentMinutes < 0) currentMinutes = 0;
+    if (currentSeconds < 0) currentSeconds = 0;
+    if (currentSeconds > 59) currentSeconds = 59;
+    isPaused = false;
+    Serial.printf("[SYSTEM] Custom countdown started: %03d:%02d\n", currentMinutes, currentSeconds);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing min or sec parameter");
+  }
 }
 
 void handleExecute() {
@@ -768,8 +945,13 @@ void handleExecute() {
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
   
-  // Have it do 2 dramatic extra full spins when reset, just like the show!
-  goToFlap(1, 2); 
+  // Set all 5 drums to 1 0 8 : 0 0 with dramatic 2 extra rotations on master
+  setDrumFlap(0, charToFlap('1'));
+  setDrumFlap(1, charToFlap('0'));
+  setDrumFlap(2, charToFlap('8'));
+  setDrumFlap(3, charToFlap('0'));
+  setDrumFlap(4, charToFlap('0'), 2);
+  
   server.send(200, "text/plain", "OK");
 }
 
@@ -799,6 +981,9 @@ void handleSetFlap() {
       Wire.write((uint8_t)10); // Speed RPM
       uint8_t err = Wire.endTransmission(true);
       if (err == 0) {
+        // Update tracking state: Unit 1 -> Drum 3, Unit 2 -> Drum 2, Unit 3 -> Drum 1, Unit 4 -> Drum 0
+        int drumIdx = 4 - unit;
+        if (drumIdx >= 0 && drumIdx < 5) drumFlapState[drumIdx] = target;
         server.send(200, "text/plain", "Slave " + String(unit) + " set to Flap " + String(target));
       } else {
         server.send(200, "text/plain", "I2C Error code " + String(err) + " on Slave " + String(unit));
@@ -830,7 +1015,7 @@ void handleCheckUpdate() {
     server.send(200, "text/plain", "Update check already in progress.");
     return;
   }
-  otaLogBuffer = ""; // Reset console logs for new run
+  otaLogBuffer = "";
   logOTA("[SYSTEM] OTA update check triggered via Web Dashboard.");
   xTaskCreatePinnedToCore(otaTaskFunction, "OTA_Task", 8192, NULL, 1, &otaTaskHandle, 0);
   server.send(200, "text/plain", "OTA check started in background...");
@@ -932,29 +1117,6 @@ void handleScanI2C() {
   server.send(200, "application/json", json);
 }
 
-void handleTestSlave() {
-  if (server.hasArg("addr") && server.hasArg("flap")) {
-    uint8_t addr = server.arg("addr").toInt();
-    uint8_t flap = server.arg("flap").toInt();
-    
-    Wire.setTimeOut(20);
-    Wire.beginTransmission(addr);
-    Wire.write(flap);
-    Wire.write((uint8_t)10); // Speed RPM
-    uint8_t error = Wire.endTransmission(true);
-
-    if (error == 0) {
-      server.send(200, "text/plain", "SUCCESS: Slave 0x" + String(addr, HEX) + " ACKed Flap " + String(flap));
-    } else if (error == 2) {
-      server.send(200, "text/plain", "NACK: No response from Slave Address 0x" + String(addr, HEX));
-    } else {
-      server.send(200, "text/plain", "I2C Error code " + String(error) + " on Address 0x" + String(addr, HEX));
-    }
-  } else {
-    server.send(400, "text/plain", "Missing Parameter");
-  }
-}
-
 void handleCalibrateJog() {
   int unit = server.hasArg("unit") ? server.arg("unit").toInt() : 0;
   int flaps = server.hasArg("flaps") ? server.arg("flaps").toInt() : 0;
@@ -1009,6 +1171,7 @@ void handleSetHome() {
     stepper.setCurrentPosition(0);
     currentFlapPosition = 0;
     absoluteFlapCount = 0;
+    drumFlapState[4] = 0;
     stepper.disableOutputs(); // De-energize coils
     Serial.printf("[CALIBRATION] Master Home saved: %d steps\n", masterHomeOffsetSteps);
     server.send(200, "text/plain", "SUCCESS: Master Blank Flap (Home) saved (" + String(masterHomeOffsetSteps) + " steps).");
@@ -1092,8 +1255,11 @@ void setup() {
     Serial.println(WiFi.localIP());
   }
 
-  server.on("/", handleRoot);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/diagnostics", HTTP_GET, handleDiagnostics);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/setCustomFlaps", HTTP_GET, handleSetCustomFlaps);
+  server.on("/startCountdown", HTTP_GET, handleStartCountdown);
   server.on("/execute", HTTP_GET, handleExecute);
   server.on("/togglePause", HTTP_GET, handleTogglePause);
   server.on("/setFlap", HTTP_GET, handleSetFlap);
@@ -1102,7 +1268,6 @@ void setup() {
   server.on("/setHome", HTTP_GET, handleSetHome);
   server.on("/reHome", HTTP_GET, handleReHome);
   server.on("/scanI2C", HTTP_GET, handleScanI2C);
-  server.on("/testSlave", HTTP_GET, handleTestSlave);
   server.on("/check-update", HTTP_GET, handleCheckUpdate);
   server.on("/ota-status", HTTP_GET, handleOtaStatus);
   server.on("/playTrack", HTTP_GET, handlePlayTrack);
@@ -1113,14 +1278,19 @@ void setup() {
   
   Wire.begin(21, 22);
 
-  goToFlap(1);
+  // Initialize initial 108:00 digits
+  setDrumFlap(0, charToFlap('1'));
+  setDrumFlap(1, charToFlap('0'));
+  setDrumFlap(2, charToFlap('8'));
+  setDrumFlap(3, charToFlap('0'));
+  setDrumFlap(4, charToFlap('0'));
 }
 
 void loop() {
   server.handleClient();
   stepper.run(); 
   if (stepper.distanceToGo() == 0) {
-    stepper.disableOutputs(); // Immediately de-energize coils when stationary to prevent motor heating!
+    stepper.disableOutputs(); // Immediately de-energize coils when stationary to prevent heating!
   } 
 
   unsigned long currentMillis = millis();
@@ -1138,20 +1308,34 @@ void loop() {
     }
   }
 
+  // --- COUNTDOWN TIMER ENGINE (SYNCS ALL 5 DRUMS) ---
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
     if (!isPaused) {
-      if (currentMinutes >= 100) {
-        goToFlap(1); 
-      } else if (currentMinutes > 0) {
-        goToFlap(40); 
-      } else if (currentMinutes == 0 && currentSeconds == 0) {
-        goToFlap(41); 
+      int d0 = (currentMinutes / 100) % 10; // Minutes 100s
+      int d1 = (currentMinutes / 10) % 10;  // Minutes 10s
+      int d2 = currentMinutes % 10;         // Minutes 1s
+      int d3 = (currentSeconds / 10) % 10;  // Seconds 10s
+      int d4 = currentSeconds % 10;         // Seconds 1s
+
+      if (currentMinutes == 0 && currentSeconds == 0) {
+        // Red Hieroglyphs / Alarm condition
+        setDrumFlap(0, 40);
+        setDrumFlap(1, 41);
+        setDrumFlap(2, 42);
+        setDrumFlap(3, 43);
+        setDrumFlap(4, 44);
+      } else {
+        setDrumFlap(0, 30 + d0);
+        setDrumFlap(1, 30 + d1);
+        setDrumFlap(2, 30 + d2);
+        setDrumFlap(3, 30 + d3);
+        setDrumFlap(4, 30 + d4);
       }
 
       if (currentMinutes == 0 && currentSeconds == 0) {
-        // Hold at zero
+        // Hold at zero alarm
       } else {
         if (currentSeconds == 0) {
           currentMinutes--;
