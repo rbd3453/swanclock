@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.32";
+const String CURRENT_VERSION = "1.4.33";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -162,25 +162,33 @@ void goToFlap(int targetFlap, int extraRotations = 0) {
   drumFlapState[4] = targetFlap;
 }
 
-// Set a specific drum (0 to 4) to a flap position
-void setDrumFlap(int drumIndex, int flap, int extraRot = 0) {
-  if (drumIndex < 0 || drumIndex > 4) return;
-  if (flap < 0 || flap >= TOTAL_FLAPS) return;
-  if (drumFlapState[drumIndex] == flap && extraRot == 0) return; // Already in place
-
-  drumFlapState[drumIndex] = flap;
+// Set a specific drum (0 to 4) to a flap position with error feedback
+bool setDrumFlap(int drumIndex, int flap, int extraRot = 0) {
+  if (drumIndex < 0 || drumIndex > 4) return false;
+  if (flap < 0 || flap >= TOTAL_FLAPS) return false;
+  if (drumFlapState[drumIndex] == flap && extraRot == 0) return true; // Already in place
 
   if (drumIndex == 4) {
     // Drum 4: Master (Right-most)
     goToFlap(flap, extraRot);
+    drumFlapState[4] = flap;
+    return true;
   } else {
     // Slaves: Drum 0 -> Addr 4, Drum 1 -> Addr 3, Drum 2 -> Addr 2, Drum 3 -> Addr 1
     uint8_t slaveAddr = (uint8_t)(4 - drumIndex);
-    Wire.setTimeOut(20);
+    Wire.setTimeOut(30);
     Wire.beginTransmission(slaveAddr);
     Wire.write((uint8_t)flap);
     Wire.write((uint8_t)10); // Default RPM
-    Wire.endTransmission(true);
+    uint8_t err = Wire.endTransmission(true);
+    delay(15); // Give I2C bus time to settle between transmissions
+    if (err == 0) {
+      drumFlapState[drumIndex] = flap;
+      return true;
+    } else {
+      Serial.printf("[I2C] Failed sending to Drum %d (Addr 0x%02X), error: %d\n", drumIndex, slaveAddr, err);
+      return false;
+    }
   }
 }
 
@@ -423,7 +431,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.32)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.33)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -443,7 +451,7 @@ const char* mainPageHtml = R"rawliteral(
     <!-- 5-DRUM MANUAL SPLIT FLAP INTERFACE -->
     <div class="card">
       <div style="font-size: 12px; color: #88ffbb; letter-spacing: 1px;">SPLIT-FLAP DIGIT OVERRIDE</div>
-      <div style="font-size: 11px; color: #666; margin-top: 2px;">Enter digits, letters, or symbols (Left ➔ Right)</div>
+      <div style="font-size: 11px; color: #666; margin-top: 2px;">Enter digits, letters, or symbols (Left -&gt; Right)</div>
       
       <div class="split-flap-container">
         <div class="flap-unit">
@@ -571,7 +579,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.32)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.33)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -929,22 +937,34 @@ void handleSetCustomFlaps() {
   dStr[3] = server.hasArg("d3") ? server.arg("d3") : " ";
   dStr[4] = server.hasArg("d4") ? server.arg("d4") : " ";
 
+  String resultLog = "";
+
   for (int i = 0; i < 5; i++) {
-    int flap = 0;
     dStr[i].trim();
+    if (dStr[i].length() == 0 && drumFlapState[i] == 0) {
+      // Drum is already at blank home and input is blank; skip sending to avoid bus delays on unattached drums (e.g. D1)
+      continue;
+    }
+    int flap = 0;
     if (dStr[i].length() == 0) {
       flap = 0;
     } else if (dStr[i].length() == 1) {
       flap = charToFlap(dStr[i].charAt(0), drumFlapState[i]);
     } else {
-      // Numerical flap index directly (e.g. "40")
       flap = dStr[i].toInt();
     }
-    setDrumFlap(i, flap);
+
+    bool ok = setDrumFlap(i, flap);
+    if (i == 4) {
+      resultLog += "D5(M):Flap " + String(flap) + " ";
+    } else {
+      uint8_t addr = 4 - i;
+      resultLog += "D" + String(i + 1) + "(0x0" + String(addr) + "):Flap " + String(flap) + (ok ? " [OK] " : " [ERR] ");
+    }
   }
 
-  Serial.printf("[MANUAL] 5-Drum Override dispatched: [%s %s %s : %s %s]\n", dStr[0].c_str(), dStr[1].c_str(), dStr[2].c_str(), dStr[3].c_str(), dStr[4].c_str());
-  server.send(200, "text/plain", "SUCCESS: Dispatched [" + dStr[0] + " " + dStr[1] + " " + dStr[2] + " : " + dStr[3] + " " + dStr[4] + "] to physical drums.");
+  Serial.printf("[MANUAL] 5-Drum Override: %s\n", resultLog.c_str());
+  server.send(200, "text/plain", resultLog.length() > 0 ? resultLog : "All selected drums already in position.");
 }
 
 void handleStartCountdown() {
