@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.3";
+const String CURRENT_VERSION = "1.4.31";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -79,7 +79,7 @@ void saveMasterCalibration(int newOffset) {
 const int START_MINUTES = 108;
 int currentMinutes = START_MINUTES;
 int currentSeconds = 0;
-bool isPaused = false;
+bool isPaused = true; // Start paused on boot: drums stay at Home until user initiates
 unsigned long previousMillis = 0;
 const long interval = 1000; // 1 second
 
@@ -399,7 +399,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.3)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.31)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -408,11 +408,11 @@ const char* mainPageHtml = R"rawliteral(
     <div class="card">
       <div style="font-size: 12px; color: #88ffbb; letter-spacing: 1px;">COUNTDOWN TIMER</div>
       <div id="timerDisplay" class="timer-val">108:00</div>
-      <div id="statusSubtext" style="font-size: 12px; color: #888;">COUNTING DOWN</div>
+      <div id="statusSubtext" style="font-size: 12px; color: #888;">HOMED & PAUSED (READY)</div>
       
       <div style="display:flex; gap:10px; margin-top:12px;">
-        <button class="btn-exec" style="flex:1;" onclick="sendCmd('/execute')">RESET (108)</button>
-        <button class="btn-pause" style="flex:1;" id="pauseBtn" onclick="sendCmd('/togglePause')">PAUSE</button>
+        <button class="btn-exec" style="flex:1;" onclick="sendCmd('/execute')">START (108)</button>
+        <button class="btn-pause" style="flex:1;" id="pauseBtn" onclick="sendCmd('/togglePause')">RESUME</button>
       </div>
     </div>
 
@@ -424,24 +424,24 @@ const char* mainPageHtml = R"rawliteral(
       <div class="split-flap-container">
         <div class="flap-unit">
           <label>D1 (MIN 100)</label>
-          <input type="text" maxlength="2" id="drum0" class="flap-box" value="1" onclick="this.select()">
+          <input type="text" maxlength="2" id="drum0" class="flap-box" value=" " onclick="this.select()">
         </div>
         <div class="flap-unit">
           <label>D2 (MIN 10)</label>
-          <input type="text" maxlength="2" id="drum1" class="flap-box" value="0" onclick="this.select()">
+          <input type="text" maxlength="2" id="drum1" class="flap-box" value=" " onclick="this.select()">
         </div>
         <div class="flap-unit">
           <label>D3 (MIN 1)</label>
-          <input type="text" maxlength="2" id="drum2" class="flap-box" value="8" onclick="this.select()">
+          <input type="text" maxlength="2" id="drum2" class="flap-box" value=" " onclick="this.select()">
         </div>
         <div class="flap-colon">:</div>
         <div class="flap-unit">
           <label>D4 (SEC 10)</label>
-          <input type="text" maxlength="2" id="drum3" class="flap-box" value="0" onclick="this.select()">
+          <input type="text" maxlength="2" id="drum3" class="flap-box" value=" " onclick="this.select()">
         </div>
         <div class="flap-unit">
           <label>D5 (MASTER)</label>
-          <input type="text" maxlength="2" id="drum4" class="flap-box" value="0" onclick="this.select()">
+          <input type="text" maxlength="2" id="drum4" class="flap-box" value=" " onclick="this.select()">
         </div>
       </div>
       
@@ -547,7 +547,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.3)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.31)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -1278,12 +1278,11 @@ void setup() {
   
   Wire.begin(21, 22);
 
-  // Initialize initial 108:00 digits
-  setDrumFlap(0, charToFlap('1'));
-  setDrumFlap(1, charToFlap('0'));
-  setDrumFlap(2, charToFlap('8'));
-  setDrumFlap(3, charToFlap('0'));
-  setDrumFlap(4, charToFlap('0'));
+  // All drums remain at their Home position (Flap 0 - Blank Flap) on boot
+  for (int i = 0; i < 5; i++) {
+    drumFlapState[i] = 0;
+  }
+  Serial.println("[SYSTEM] Boot sequence complete. All drums homed at Flap 0. Timer paused and ready.");
 }
 
 void loop() {
