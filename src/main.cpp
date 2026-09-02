@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.31";
+const String CURRENT_VERSION = "1.4.32";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -100,23 +100,47 @@ void logOTA(const String& msg) {
   }
 }
 
-// --- CHARACTER TO FLAP TRANSLATION ---
-int charToFlap(char c) {
+// --- PHYSICAL FLAP MAPPING ---
+// Flap 0: Blank (Home)
+// Flaps 1..5: 5 Red Hieroglyphics
+// Flaps 6..15: 0-9 (Set 1)
+// Flaps 16..25: 0-9 (Set 2)
+// Flaps 26..35: 0-9 (Set 3)
+// Flaps 36..44: 0-8 (Set 4)
+
+int getNextFlapForDigit(int currentFlap, int digit) {
+  if (digit < 0 || digit > 9) return 0;
+  
+  int candidates[4];
+  int numCandidates = 0;
+  
+  if (6 + digit < 45) candidates[numCandidates++] = 6 + digit;
+  if (16 + digit < 45) candidates[numCandidates++] = 16 + digit;
+  if (26 + digit < 45) candidates[numCandidates++] = 26 + digit;
+  if (36 + digit < 45) candidates[numCandidates++] = 36 + digit;
+  
+  int bestFlap = candidates[0];
+  int minAdvance = 999;
+  
+  for (int i = 0; i < numCandidates; i++) {
+    int flap = candidates[i];
+    int advance = flap - currentFlap;
+    if (advance < 0) advance += TOTAL_FLAPS;
+    if (advance < minAdvance) {
+      minAdvance = advance;
+      bestFlap = flap;
+    }
+  }
+  return bestFlap;
+}
+
+int charToFlap(char c, int currentFlap = 0) {
   if (c >= '0' && c <= '9') {
-    return 30 + (c - '0'); // Flaps 30 to 39
+    return getNextFlapForDigit(currentFlap, c - '0');
   }
-  if (c >= 'a' && c <= 'z') {
-    c = c - 'a' + 'A';
-  }
-  if (c >= 'A' && c <= 'Z') {
-    return 1 + (c - 'A'); // Flaps 1 to 26
-  }
-  if (c == '?') return 27;
-  if (c == '!') return 28;
-  if (c == '-' || c == '.') return 29;
-  if (c == ' ') return 0; // Blank flap
-  if (c == '*' || c == '#') return 40; // Hieroglyphs
-  return 0; // Default to blank
+  if (c == ' ') return 0; // Blank (Home)
+  if (c == '*' || c == '#') return 1; // Default to Hieroglyphic 1
+  return 0; // Default to Blank
 }
 
 // --- DRIFT-FREE FLAP MATH WITH COIL POWER MANAGEMENT ---
@@ -399,7 +423,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.31)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.32)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -547,7 +571,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.31)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.32)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -911,7 +935,7 @@ void handleSetCustomFlaps() {
     if (dStr[i].length() == 0) {
       flap = 0;
     } else if (dStr[i].length() == 1) {
-      flap = charToFlap(dStr[i].charAt(0));
+      flap = charToFlap(dStr[i].charAt(0), drumFlapState[i]);
     } else {
       // Numerical flap index directly (e.g. "40")
       flap = dStr[i].toInt();
@@ -946,11 +970,11 @@ void handleExecute() {
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
   
   // Set all 5 drums to 1 0 8 : 0 0 with dramatic 2 extra rotations on master
-  setDrumFlap(0, charToFlap('1'));
-  setDrumFlap(1, charToFlap('0'));
-  setDrumFlap(2, charToFlap('8'));
-  setDrumFlap(3, charToFlap('0'));
-  setDrumFlap(4, charToFlap('0'), 2);
+  setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], 1));
+  setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], 0));
+  setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], 8));
+  setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], 0));
+  setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], 0), 2);
   
   server.send(200, "text/plain", "OK");
 }
@@ -1319,18 +1343,18 @@ void loop() {
       int d4 = currentSeconds % 10;         // Seconds 1s
 
       if (currentMinutes == 0 && currentSeconds == 0) {
-        // Red Hieroglyphs / Alarm condition
-        setDrumFlap(0, 40);
-        setDrumFlap(1, 41);
-        setDrumFlap(2, 42);
-        setDrumFlap(3, 43);
-        setDrumFlap(4, 44);
+        // Red Hieroglyphs 1 through 5
+        setDrumFlap(0, 1);
+        setDrumFlap(1, 2);
+        setDrumFlap(2, 3);
+        setDrumFlap(3, 4);
+        setDrumFlap(4, 5);
       } else {
-        setDrumFlap(0, 30 + d0);
-        setDrumFlap(1, 30 + d1);
-        setDrumFlap(2, 30 + d2);
-        setDrumFlap(3, 30 + d3);
-        setDrumFlap(4, 30 + d4);
+        setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
+        setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
+        setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
+        setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
+        setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4));
       }
 
       if (currentMinutes == 0 && currentSeconds == 0) {
