@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.34";
+const String CURRENT_VERSION = "1.4.35";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -58,6 +58,11 @@ long absoluteFlapCount = 0; // Tracks total lifetime flaps to eliminate math dri
 // Drum 4: Right-most (Master Drum - Local ESP32)
 int drumFlapState[5] = {0, 0, 0, 0, 0};
 
+// --- POWER & MOVEMENT PROFILES ---
+// 0 = Eco / Safe Sequential Mode (1.5A Power Supply) - Moves drums one-at-a-time, max ~300mA draw
+// 1 = Fast Simultaneous Mode (3.0A+ Power Supply) - Moves drums in parallel
+int powerMode = 0; // Default to Safe Sequential Mode
+
 // --- CALIBRATION STORAGE (NVS PREFERENCES) ---
 Preferences prefs;
 int masterHomeOffsetSteps = (int)(8 * STEPS_PER_FLAP); // Default fallback ~728 steps
@@ -73,6 +78,19 @@ void saveMasterCalibration(int newOffset) {
   prefs.putInt("masterOffset", newOffset);
   prefs.end();
   masterHomeOffsetSteps = newOffset;
+}
+
+void loadPowerSettings() {
+  prefs.begin("settings", false);
+  powerMode = prefs.getInt("powerMode", 0);
+  prefs.end();
+}
+
+void savePowerSettings(int mode) {
+  prefs.begin("settings", false);
+  prefs.putInt("powerMode", mode);
+  prefs.end();
+  powerMode = mode;
 }
 
 // --- TIMER VARIABLES ---
@@ -188,6 +206,33 @@ bool setDrumFlap(int drumIndex, int flap, int extraRot = 0) {
     } else {
       Serial.printf("[I2C] Failed sending to Drum %d (Addr 0x%02X), error: %d\n", drumIndex, slaveAddr, err);
       return false;
+    }
+  }
+}
+
+// Wait for a drum to complete its move and power off coils (ensures only 1 motor ever active)
+void waitForDrum(int drumIndex, unsigned long timeoutMs = 3500) {
+  if (drumIndex == 4) {
+    unsigned long start = millis();
+    while (stepper.distanceToGo() != 0 && (millis() - start < timeoutMs)) {
+      stepper.run();
+      yield();
+    }
+    stepper.disableOutputs();
+  } else {
+    uint8_t slaveAddr = (uint8_t)(4 - drumIndex);
+    unsigned long start = millis();
+    delay(80); // Brief delay for slave to initiate rotation
+    while (millis() - start < timeoutMs) {
+      Wire.requestFrom(slaveAddr, (uint8_t)1);
+      if (Wire.available()) {
+        uint8_t isBusy = Wire.read();
+        if (isBusy == 0) {
+          break; // Slave is stationary and coils are OFF!
+        }
+      }
+      delay(40);
+      yield();
     }
   }
 }
@@ -431,7 +476,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.34)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.35)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -479,6 +524,7 @@ const char* mainPageHtml = R"rawliteral(
       
       <button class="btn-submit-flaps" onclick="submit5Drums()">DISPLAY ON PHYSICAL DRUMS</button>
       <div id="drumCmdStatus" class="status-msg" style="color: #00ccff;"></div>
+      <div id="profileBadge" style="font-size: 11px; color: #ffaa00; margin-top: 6px;">PROFILE: 1.5A SAFE SEQUENTIAL</div>
     </div>
 
     <!-- CUSTOM COUNTDOWN STARTER -->
@@ -534,6 +580,13 @@ const char* mainPageHtml = R"rawliteral(
           document.getElementById('timerDisplay').innerText = data.timer;
           document.getElementById('pauseBtn').innerText = data.paused ? "RESUME" : "PAUSE";
           document.getElementById('statusSubtext').innerText = data.paused ? "TIMER PAUSED" : "COUNTING DOWN";
+          if (data.powerMode !== undefined) {
+            let badge = document.getElementById('profileBadge');
+            badge.innerText = data.powerMode == 0 
+              ? "PROFILE: 1.5A SAFE SEQUENTIAL (Brownout-Proof)" 
+              : "PROFILE: 3.0A+ FAST SIMULTANEOUS";
+            badge.style.color = data.powerMode == 0 ? "#ffaa00" : "#00ccff";
+          }
         })
         .catch(err => console.log(err));
     }, 200);
@@ -579,9 +632,27 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.34)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.35)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
+    </div>
+
+    <!-- POWER & MOVEMENT PROFILE -->
+    <div class="card" style="border-color: #ffaa00;">
+      <label style="color: #ffaa00;">POWER & MOVEMENT PROFILE</label>
+      <div style="font-size: 11px; color: #ffdd88; margin-bottom: 8px;">
+        Choose movement behavior based on your 5V power supply capacity.
+      </div>
+      <div class="input-group">
+        <label>ACTIVE POWER PROFILE</label>
+        <select id="powerModeSelect" onchange="submitPowerMode()">
+          <option value="0">Safe Sequential Mode (1.5A Power Supply)</option>
+          <option value="1">Fast Simultaneous Mode (3.0A+ Power Supply)</option>
+        </select>
+      </div>
+      <div id="powerModeStatus" style="font-size: 11px; color: #88ffbb; margin-top: 4px;">
+        Safe Mode: Moves drums one-by-one (max ~300mA draw) to eliminate brownout reboots.
+      </div>
     </div>
 
     <!-- DRUM ZERO CALIBRATION TOOL -->
@@ -883,6 +954,35 @@ const char* diagnosticsPageHtml = R"rawliteral(
     sliderEl.addEventListener('mouseup', () => { isUserInteractingSlider = false; });
     sliderEl.addEventListener('touchend', () => { isUserInteractingSlider = false; });
 
+    function submitPowerMode() {
+      let mode = document.getElementById('powerModeSelect').value;
+      let statusEl = document.getElementById('powerModeStatus');
+      statusEl.innerText = "Saving power profile...";
+      fetch('/setPowerMode?mode=' + mode)
+        .then(res => res.text())
+        .then(msg => {
+          statusEl.innerText = mode == "0" 
+            ? "Safe Mode ACTIVE: Drums move one-at-a-time (max ~300mA draw)." 
+            : "Fast Mode ACTIVE: All drums rotate simultaneously (requires 3A+ supply).";
+        })
+        .catch(err => { statusEl.innerText = "[ERROR] " + err; });
+    }
+
+    function loadPowerMode() {
+      fetch('/status')
+        .then(res => res.json())
+        .then(data => {
+          if (data.powerMode !== undefined) {
+            document.getElementById('powerModeSelect').value = data.powerMode;
+            document.getElementById('powerModeStatus').innerText = data.powerMode == 0 
+              ? "Safe Mode ACTIVE: Drums move one-at-a-time (max ~300mA draw)." 
+              : "Fast Mode ACTIVE: All drums rotate simultaneously (requires 3A+ supply).";
+          }
+        })
+        .catch(err => console.log(err));
+    }
+
+    loadPowerMode();
     loadAudioInfo();
     pollOtaStatus();
   </script>
@@ -921,10 +1021,22 @@ void handleStatus() {
   json += "\"d1\":" + String(drumFlapState[1]) + ",";
   json += "\"d2\":" + String(drumFlapState[2]) + ",";
   json += "\"d3\":" + String(drumFlapState[3]) + ",";
-  json += "\"d4\":" + String(drumFlapState[4]);
+  json += "\"d4\":" + String(drumFlapState[4]) + ",";
+  json += "\"powerMode\":" + String(powerMode);
   json += "}";
 
   server.send(200, "application/json", json);
+}
+
+void handleSetPowerMode() {
+  if (server.hasArg("mode")) {
+    int mode = server.arg("mode").toInt();
+    savePowerSettings(mode);
+    Serial.printf("[POWER] Power Profile set to: %s\n", (powerMode == 0 ? "Safe Sequential (1.5A)" : "Fast Simultaneous (3.0A+)"));
+    server.send(200, "text/plain", "Power profile saved.");
+  } else {
+    server.send(400, "text/plain", "Missing mode parameter");
+  }
 }
 
 void handleSetCustomFlaps() {
@@ -961,7 +1073,13 @@ void handleSetCustomFlaps() {
       uint8_t addr = 4 - i;
       resultLog += "D" + String(i + 1) + "(0x0" + String(addr) + "):Flap " + String(flap) + (ok ? " [OK] " : " [ERR] ");
     }
-    delay(200); // 200ms stagger between drum starts to eliminate simultaneous power inrush!
+    
+    // In Safe Sequential Mode (1.5A), wait for drum to finish and de-energize coils before starting next
+    if (powerMode == 0 && ok) {
+      waitForDrum(i);
+    } else {
+      delay(150); // In Fast Mode (3A+), stagger slightly
+    }
   }
 
   Serial.printf("[MANUAL] 5-Drum Override: %s\n", resultLog.c_str());
@@ -990,16 +1108,17 @@ void handleExecute() {
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
   
-  // Set all 5 drums to 1 0 8 : 0 0 with staggered start and dramatic 2 extra rotations on master
+  // Set all 5 drums to 1 0 8 : 0 0
   setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], 1));
-  delay(150);
+  if (powerMode == 0) waitForDrum(0); else delay(150);
   setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], 0));
-  delay(150);
+  if (powerMode == 0) waitForDrum(1); else delay(150);
   setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], 8));
-  delay(150);
+  if (powerMode == 0) waitForDrum(2); else delay(150);
   setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], 0));
-  delay(150);
+  if (powerMode == 0) waitForDrum(3); else delay(150);
   setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], 0), 2);
+  if (powerMode == 0) waitForDrum(4);
   
   server.send(200, "text/plain", "OK");
 }
@@ -1265,6 +1384,7 @@ void setup() {
   Serial.println("\n=== SWAN STATION MASTER BRAIN INITIALIZING ===");
 
   loadMasterCalibration();
+  loadPowerSettings();
 
   pinMode(hallSensorPin, INPUT_PULLUP);
   pinMode(potPin, INPUT);
@@ -1323,6 +1443,7 @@ void setup() {
   server.on("/stopAudio", HTTP_GET, handleStopAudio);
   server.on("/setVolume", HTTP_GET, handleSetVolume);
   server.on("/getAudioInfo", HTTP_GET, handleGetAudioInfo);
+  server.on("/setPowerMode", HTTP_GET, handleSetPowerMode);
   server.begin();
   
   Wire.begin(21, 22);
@@ -1370,14 +1491,15 @@ void loop() {
       if (currentMinutes == 0 && currentSeconds == 0) {
         // Red Hieroglyphs 1 through 5
         setDrumFlap(0, 1);
-        delay(80);
+        if (powerMode == 0) waitForDrum(0); else delay(80);
         setDrumFlap(1, 2);
-        delay(80);
+        if (powerMode == 0) waitForDrum(1); else delay(80);
         setDrumFlap(2, 3);
-        delay(80);
+        if (powerMode == 0) waitForDrum(2); else delay(80);
         setDrumFlap(3, 4);
-        delay(80);
+        if (powerMode == 0) waitForDrum(3); else delay(80);
         setDrumFlap(4, 5);
+        if (powerMode == 0) waitForDrum(4);
       } else {
         int t0 = getNextFlapForDigit(drumFlapState[0], d0);
         int t1 = getNextFlapForDigit(drumFlapState[1], d1);
@@ -1385,10 +1507,10 @@ void loop() {
         int t3 = getNextFlapForDigit(drumFlapState[3], d3);
         int t4 = getNextFlapForDigit(drumFlapState[4], d4);
 
-        if (drumFlapState[0] != t0) { setDrumFlap(0, t0); delay(60); }
-        if (drumFlapState[1] != t1) { setDrumFlap(1, t1); delay(60); }
-        if (drumFlapState[2] != t2) { setDrumFlap(2, t2); delay(60); }
-        if (drumFlapState[3] != t3) { setDrumFlap(3, t3); delay(60); }
+        if (drumFlapState[0] != t0) { setDrumFlap(0, t0); if (powerMode == 0) waitForDrum(0); else delay(60); }
+        if (drumFlapState[1] != t1) { setDrumFlap(1, t1); if (powerMode == 0) waitForDrum(1); else delay(60); }
+        if (drumFlapState[2] != t2) { setDrumFlap(2, t2); if (powerMode == 0) waitForDrum(2); else delay(60); }
+        if (drumFlapState[3] != t3) { setDrumFlap(3, t3); if (powerMode == 0) waitForDrum(3); else delay(60); }
         setDrumFlap(4, t4);
       }
 
