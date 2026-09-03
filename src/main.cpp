@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.33";
+const String CURRENT_VERSION = "1.4.34";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -431,7 +431,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.33)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.34)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -579,7 +579,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.33)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.34)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -961,6 +961,7 @@ void handleSetCustomFlaps() {
       uint8_t addr = 4 - i;
       resultLog += "D" + String(i + 1) + "(0x0" + String(addr) + "):Flap " + String(flap) + (ok ? " [OK] " : " [ERR] ");
     }
+    delay(200); // 200ms stagger between drum starts to eliminate simultaneous power inrush!
   }
 
   Serial.printf("[MANUAL] 5-Drum Override: %s\n", resultLog.c_str());
@@ -989,11 +990,15 @@ void handleExecute() {
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
   
-  // Set all 5 drums to 1 0 8 : 0 0 with dramatic 2 extra rotations on master
+  // Set all 5 drums to 1 0 8 : 0 0 with staggered start and dramatic 2 extra rotations on master
   setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], 1));
+  delay(150);
   setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], 0));
+  delay(150);
   setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], 8));
+  delay(150);
   setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], 0));
+  delay(150);
   setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], 0), 2);
   
   server.send(200, "text/plain", "OK");
@@ -1365,16 +1370,26 @@ void loop() {
       if (currentMinutes == 0 && currentSeconds == 0) {
         // Red Hieroglyphs 1 through 5
         setDrumFlap(0, 1);
+        delay(80);
         setDrumFlap(1, 2);
+        delay(80);
         setDrumFlap(2, 3);
+        delay(80);
         setDrumFlap(3, 4);
+        delay(80);
         setDrumFlap(4, 5);
       } else {
-        setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
-        setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
-        setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
-        setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
-        setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4));
+        int t0 = getNextFlapForDigit(drumFlapState[0], d0);
+        int t1 = getNextFlapForDigit(drumFlapState[1], d1);
+        int t2 = getNextFlapForDigit(drumFlapState[2], d2);
+        int t3 = getNextFlapForDigit(drumFlapState[3], d3);
+        int t4 = getNextFlapForDigit(drumFlapState[4], d4);
+
+        if (drumFlapState[0] != t0) { setDrumFlap(0, t0); delay(60); }
+        if (drumFlapState[1] != t1) { setDrumFlap(1, t1); delay(60); }
+        if (drumFlapState[2] != t2) { setDrumFlap(2, t2); delay(60); }
+        if (drumFlapState[3] != t3) { setDrumFlap(3, t3); delay(60); }
+        setDrumFlap(4, t4);
       }
 
       if (currentMinutes == 0 && currentSeconds == 0) {
