@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.35";
+const String CURRENT_VERSION = "1.4.36";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -57,6 +57,7 @@ long absoluteFlapCount = 0; // Tracks total lifetime flaps to eliminate math dri
 // Drum 3: 4th from Left / 2nd from Right (Slave 1 - I2C 0x01)
 // Drum 4: Right-most (Master Drum - Local ESP32)
 int drumFlapState[5] = {0, 0, 0, 0, 0};
+int lastDisplayedDigits[5] = {-1, -1, -1, -1, -1}; // Tracks displayed digits to eliminate unnecessary I2C traffic
 
 // --- POWER & MOVEMENT PROFILES ---
 // 0 = Eco / Safe Sequential Mode (1.5A Power Supply) - Moves drums one-at-a-time, max ~300mA draw
@@ -211,7 +212,7 @@ bool setDrumFlap(int drumIndex, int flap, int extraRot = 0) {
 }
 
 // Wait for a drum to complete its move and power off coils (ensures only 1 motor ever active)
-void waitForDrum(int drumIndex, unsigned long timeoutMs = 3500) {
+void waitForDrum(int drumIndex, unsigned long timeoutMs = 1800) {
   if (drumIndex == 4) {
     unsigned long start = millis();
     while (stepper.distanceToGo() != 0 && (millis() - start < timeoutMs)) {
@@ -222,7 +223,7 @@ void waitForDrum(int drumIndex, unsigned long timeoutMs = 3500) {
   } else {
     uint8_t slaveAddr = (uint8_t)(4 - drumIndex);
     unsigned long start = millis();
-    delay(80); // Brief delay for slave to initiate rotation
+    delay(50); // Brief delay for slave to initiate rotation
     while (millis() - start < timeoutMs) {
       Wire.requestFrom(slaveAddr, (uint8_t)1);
       if (Wire.available()) {
@@ -230,8 +231,11 @@ void waitForDrum(int drumIndex, unsigned long timeoutMs = 3500) {
         if (isBusy == 0) {
           break; // Slave is stationary and coils are OFF!
         }
+      } else {
+        // No response from address (unattached device like 0x04) -> abort immediately, don't hang!
+        break;
       }
-      delay(40);
+      delay(30);
       yield();
     }
   }
@@ -476,7 +480,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.35)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.36)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -632,7 +636,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.35)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.36)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -1082,6 +1086,8 @@ void handleSetCustomFlaps() {
     }
   }
 
+  for (int k = 0; k < 5; k++) lastDisplayedDigits[k] = -1;
+
   Serial.printf("[MANUAL] 5-Drum Override: %s\n", resultLog.c_str());
   server.send(200, "text/plain", resultLog.length() > 0 ? resultLog : "All selected drums already in position.");
 }
@@ -1093,6 +1099,8 @@ void handleStartCountdown() {
     if (currentMinutes < 0) currentMinutes = 0;
     if (currentSeconds < 0) currentSeconds = 0;
     if (currentSeconds > 59) currentSeconds = 59;
+    for (int k = 0; k < 5; k++) lastDisplayedDigits[k] = -1;
+    previousMillis = millis(); // Clean baseline
     isPaused = false;
     Serial.printf("[SYSTEM] Custom countdown started: %03d:%02d\n", currentMinutes, currentSeconds);
     server.send(200, "text/plain", "OK");
@@ -1104,21 +1112,23 @@ void handleStartCountdown() {
 void handleExecute() {
   currentMinutes = START_MINUTES;
   currentSeconds = 0;
+  for (int k = 0; k < 5; k++) lastDisplayedDigits[k] = -1;
+  previousMillis = millis(); // Clean baseline
   isPaused = false;
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
   
   // Set all 5 drums to 1 0 8 : 0 0
-  setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], 1));
-  if (powerMode == 0) waitForDrum(0); else delay(150);
-  setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], 0));
-  if (powerMode == 0) waitForDrum(1); else delay(150);
-  setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], 8));
-  if (powerMode == 0) waitForDrum(2); else delay(150);
-  setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], 0));
-  if (powerMode == 0) waitForDrum(3); else delay(150);
-  setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], 0), 2);
-  if (powerMode == 0) waitForDrum(4);
+  bool ok0 = setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], 1));
+  if (ok0 && powerMode == 0) waitForDrum(0); else delay(100);
+  bool ok1 = setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], 0));
+  if (ok1 && powerMode == 0) waitForDrum(1); else delay(100);
+  bool ok2 = setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], 8));
+  if (ok2 && powerMode == 0) waitForDrum(2); else delay(100);
+  bool ok3 = setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], 0));
+  if (ok3 && powerMode == 0) waitForDrum(3); else delay(100);
+  bool ok4 = setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], 0), 2);
+  if (ok4 && powerMode == 0) waitForDrum(4);
   
   server.send(200, "text/plain", "OK");
 }
@@ -1395,8 +1405,8 @@ void setup() {
   currentVolume = constrain(map(initialPot, 15, 4080, 0, 30), 0, 30);
   lastPotVolume = currentVolume;
 
-  stepper.setMaxSpeed(800);
-  stepper.setAcceleration(400);
+  stepper.setMaxSpeed(1200);
+  stepper.setAcceleration(2500);
 
   findHome();
 
@@ -1479,7 +1489,7 @@ void loop() {
 
   // --- COUNTDOWN TIMER ENGINE (SYNCS ALL 5 DRUMS) ---
   if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
+    previousMillis += interval; // True drift-free 1000ms cadence
 
     if (!isPaused) {
       int d0 = (currentMinutes / 100) % 10; // Minutes 100s
@@ -1491,27 +1501,41 @@ void loop() {
       if (currentMinutes == 0 && currentSeconds == 0) {
         // Red Hieroglyphs 1 through 5
         setDrumFlap(0, 1);
-        if (powerMode == 0) waitForDrum(0); else delay(80);
         setDrumFlap(1, 2);
-        if (powerMode == 0) waitForDrum(1); else delay(80);
         setDrumFlap(2, 3);
-        if (powerMode == 0) waitForDrum(2); else delay(80);
         setDrumFlap(3, 4);
-        if (powerMode == 0) waitForDrum(3); else delay(80);
         setDrumFlap(4, 5);
-        if (powerMode == 0) waitForDrum(4);
       } else {
-        int t0 = getNextFlapForDigit(drumFlapState[0], d0);
-        int t1 = getNextFlapForDigit(drumFlapState[1], d1);
-        int t2 = getNextFlapForDigit(drumFlapState[2], d2);
-        int t3 = getNextFlapForDigit(drumFlapState[3], d3);
-        int t4 = getNextFlapForDigit(drumFlapState[4], d4);
+        // Only command drums when their displayed digit actually changes!
+        // Drum 0 (Slave 4 - 0x04): only if changed
+        if (d0 != lastDisplayedDigits[0]) {
+          lastDisplayedDigits[0] = d0;
+          setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
+        }
 
-        if (drumFlapState[0] != t0) { setDrumFlap(0, t0); if (powerMode == 0) waitForDrum(0); else delay(60); }
-        if (drumFlapState[1] != t1) { setDrumFlap(1, t1); if (powerMode == 0) waitForDrum(1); else delay(60); }
-        if (drumFlapState[2] != t2) { setDrumFlap(2, t2); if (powerMode == 0) waitForDrum(2); else delay(60); }
-        if (drumFlapState[3] != t3) { setDrumFlap(3, t3); if (powerMode == 0) waitForDrum(3); else delay(60); }
-        setDrumFlap(4, t4);
+        // Drum 1 (Slave 3 - 0x03): Minutes 10s (changes once every 10 min)
+        if (d1 != lastDisplayedDigits[1]) {
+          lastDisplayedDigits[1] = d1;
+          setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
+        }
+
+        // Drum 2 (Slave 2 - 0x02): Minutes 1s (changes once every 60 sec)
+        if (d2 != lastDisplayedDigits[2]) {
+          lastDisplayedDigits[2] = d2;
+          setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
+        }
+
+        // Drum 3 (Slave 1 - 0x01): Seconds 10s (changes once every 10 sec)
+        if (d3 != lastDisplayedDigits[3]) {
+          lastDisplayedDigits[3] = d3;
+          setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
+        }
+
+        // Drum 4 (Master): Seconds 1s (changes EVERY second!)
+        if (d4 != lastDisplayedDigits[4]) {
+          lastDisplayedDigits[4] = d4;
+          setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4));
+        }
       }
 
       if (currentMinutes == 0 && currentSeconds == 0) {
