@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.36";
+const String CURRENT_VERSION = "1.4.37";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -94,7 +94,16 @@ void savePowerSettings(int mode) {
   powerMode = mode;
 }
 
-// --- TIMER VARIABLES ---
+// --- TIMER VARIABLES & STATE MACHINE ---
+enum TimerState {
+  TIMER_STOPPED,
+  TIMER_HOLDING, // Setting drums to target time and holding 5 seconds before counting down
+  TIMER_RUNNING
+};
+TimerState timerState = TIMER_STOPPED;
+unsigned long holdStartTime = 0;
+const unsigned long HOLD_DURATION_MS = 5000; // 5-second hold at starting time
+
 const int START_MINUTES = 108;
 int currentMinutes = START_MINUTES;
 int currentSeconds = 0;
@@ -480,7 +489,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.36)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.37)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -583,7 +592,7 @@ const char* mainPageHtml = R"rawliteral(
         .then(data => {
           document.getElementById('timerDisplay').innerText = data.timer;
           document.getElementById('pauseBtn').innerText = data.paused ? "RESUME" : "PAUSE";
-          document.getElementById('statusSubtext').innerText = data.paused ? "TIMER PAUSED" : "COUNTING DOWN";
+          document.getElementById('statusSubtext').innerText = data.statusText || (data.paused ? "TIMER PAUSED" : "COUNTING DOWN");
           if (data.powerMode !== undefined) {
             let badge = document.getElementById('profileBadge');
             badge.innerText = data.powerMode == 0 
@@ -636,7 +645,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.36)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.37)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -1008,14 +1017,26 @@ void handleDiagnostics() {
 
 void handleStatus() {
   char timerBuf[16];
-  if (isPaused) {
-    snprintf(timerBuf, sizeof(timerBuf), "PAUSED %03d:%02d", currentMinutes, currentSeconds);
+  String statusMsg = "";
+  if (timerState == TIMER_HOLDING) {
+    long elapsed = millis() - holdStartTime;
+    int remaining = (int)((HOLD_DURATION_MS - elapsed) / 1000) + 1;
+    if (remaining < 1) remaining = 1;
+    if (remaining > 5) remaining = 5;
+    snprintf(timerBuf, sizeof(timerBuf), "%03d:%02d", currentMinutes, currentSeconds);
+    statusMsg = "HOLDING " + String(timerBuf) + " (STARTS IN " + String(remaining) + "s)";
+  } else if (isPaused) {
+    snprintf(timerBuf, sizeof(timerBuf), "%03d:%02d", currentMinutes, currentSeconds);
+    statusMsg = "TIMER PAUSED";
   } else {
     snprintf(timerBuf, sizeof(timerBuf), "%03d:%02d", currentMinutes, currentSeconds);
+    statusMsg = "COUNTING DOWN";
   }
 
   String json = "{";
   json += "\"timer\":\"" + String(timerBuf) + "\",";
+  json += "\"statusText\":\"" + statusMsg + "\",";
+  json += "\"holding\":" + String(timerState == TIMER_HOLDING ? "true" : "false") + ",";
   json += "\"minutes\":" + String(currentMinutes) + ",";
   json += "\"seconds\":" + String(currentSeconds) + ",";
   json += "\"paused\":" + String(isPaused ? "true" : "false") + ",";
@@ -1045,6 +1066,7 @@ void handleSetPowerMode() {
 
 void handleSetCustomFlaps() {
   isPaused = true; // Auto-pause countdown when manual flaps are commanded
+  timerState = TIMER_STOPPED;
 
   String dStr[5];
   dStr[0] = server.hasArg("d0") ? server.arg("d0") : " ";
@@ -1092,17 +1114,54 @@ void handleSetCustomFlaps() {
   server.send(200, "text/plain", resultLog.length() > 0 ? resultLog : "All selected drums already in position.");
 }
 
+void initiateCountdown(int mins, int secs, bool dramaticMasterRot = false) {
+  currentMinutes = mins;
+  currentSeconds = secs;
+  isPaused = false;
+  timerState = TIMER_HOLDING;
+
+  int d0 = (mins / 100) % 10;
+  int d1 = (mins / 10) % 10;
+  int d2 = mins % 10;
+  int d3 = (secs / 10) % 10;
+  int d4 = secs % 10;
+
+  Serial.printf("[SYSTEM] Aligning drums to starting time %03d:%02d...\n", mins, secs);
+
+  bool ok0 = setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
+  if (ok0 && powerMode == 0) waitForDrum(0); else delay(100);
+
+  bool ok1 = setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
+  if (ok1 && powerMode == 0) waitForDrum(1); else delay(100);
+
+  bool ok2 = setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
+  if (ok2 && powerMode == 0) waitForDrum(2); else delay(100);
+
+  bool ok3 = setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
+  if (ok3 && powerMode == 0) waitForDrum(3); else delay(100);
+
+  int extra = dramaticMasterRot ? 2 : 0;
+  bool ok4 = setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4), extra);
+  if (ok4 && powerMode == 0) waitForDrum(4);
+
+  lastDisplayedDigits[0] = d0;
+  lastDisplayedDigits[1] = d1;
+  lastDisplayedDigits[2] = d2;
+  lastDisplayedDigits[3] = d3;
+  lastDisplayedDigits[4] = d4;
+
+  holdStartTime = millis(); // Start the 5-second countdown hold
+  Serial.printf("[SYSTEM] Drums aligned to %03d:%02d. Holding for 5 seconds before countdown begins...\n", mins, secs);
+}
+
 void handleStartCountdown() {
   if (server.hasArg("min") && server.hasArg("sec")) {
-    currentMinutes = server.arg("min").toInt();
-    currentSeconds = server.arg("sec").toInt();
-    if (currentMinutes < 0) currentMinutes = 0;
-    if (currentSeconds < 0) currentSeconds = 0;
-    if (currentSeconds > 59) currentSeconds = 59;
-    for (int k = 0; k < 5; k++) lastDisplayedDigits[k] = -1;
-    previousMillis = millis(); // Clean baseline
-    isPaused = false;
-    Serial.printf("[SYSTEM] Custom countdown started: %03d:%02d\n", currentMinutes, currentSeconds);
+    int m = server.arg("min").toInt();
+    int s = server.arg("sec").toInt();
+    if (m < 0) m = 0;
+    if (s < 0) s = 0;
+    if (s > 59) s = 59;
+    initiateCountdown(m, s, false);
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Missing min or sec parameter");
@@ -1110,26 +1169,9 @@ void handleStartCountdown() {
 }
 
 void handleExecute() {
-  currentMinutes = START_MINUTES;
-  currentSeconds = 0;
-  for (int k = 0; k < 5; k++) lastDisplayedDigits[k] = -1;
-  previousMillis = millis(); // Clean baseline
-  isPaused = false;
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
-  
-  // Set all 5 drums to 1 0 8 : 0 0
-  bool ok0 = setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], 1));
-  if (ok0 && powerMode == 0) waitForDrum(0); else delay(100);
-  bool ok1 = setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], 0));
-  if (ok1 && powerMode == 0) waitForDrum(1); else delay(100);
-  bool ok2 = setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], 8));
-  if (ok2 && powerMode == 0) waitForDrum(2); else delay(100);
-  bool ok3 = setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], 0));
-  if (ok3 && powerMode == 0) waitForDrum(3); else delay(100);
-  bool ok4 = setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], 0), 2);
-  if (ok4 && powerMode == 0) waitForDrum(4);
-  
+  initiateCountdown(START_MINUTES, 0, true);
   server.send(200, "text/plain", "OK");
 }
 
@@ -1487,65 +1529,64 @@ void loop() {
     }
   }
 
-  // --- COUNTDOWN TIMER ENGINE (SYNCS ALL 5 DRUMS) ---
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis += interval; // True drift-free 1000ms cadence
-
-    if (!isPaused) {
-      int d0 = (currentMinutes / 100) % 10; // Minutes 100s
-      int d1 = (currentMinutes / 10) % 10;  // Minutes 10s
-      int d2 = currentMinutes % 10;         // Minutes 1s
-      int d3 = (currentSeconds / 10) % 10;  // Seconds 10s
-      int d4 = currentSeconds % 10;         // Seconds 1s
+  // --- TIMER STATE MACHINE & COUNTDOWN ENGINE ---
+  if (timerState == TIMER_HOLDING) {
+    if (!isPaused && (millis() - holdStartTime >= HOLD_DURATION_MS)) {
+      timerState = TIMER_RUNNING;
+      previousMillis = millis(); // Reset 1000ms baseline for 1st countdown tick
+      Serial.println("[SYSTEM] 5-second hold complete. COUNTDOWN INITIATING!");
+    }
+  } else if (timerState == TIMER_RUNNING && !isPaused) {
+    if (currentMillis - previousMillis >= interval) {
+      previousMillis += interval; // True drift-free 1000ms cadence
 
       if (currentMinutes == 0 && currentSeconds == 0) {
-        // Red Hieroglyphs 1 through 5
+        // Red Hieroglyphs 1 through 5 (Alarm condition)
         setDrumFlap(0, 1);
         setDrumFlap(1, 2);
         setDrumFlap(2, 3);
         setDrumFlap(3, 4);
         setDrumFlap(4, 5);
+        timerState = TIMER_STOPPED;
       } else {
-        // Only command drums when their displayed digit actually changes!
-        // Drum 0 (Slave 4 - 0x04): only if changed
-        if (d0 != lastDisplayedDigits[0]) {
-          lastDisplayedDigits[0] = d0;
-          setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
-        }
-
-        // Drum 1 (Slave 3 - 0x03): Minutes 10s (changes once every 10 min)
-        if (d1 != lastDisplayedDigits[1]) {
-          lastDisplayedDigits[1] = d1;
-          setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
-        }
-
-        // Drum 2 (Slave 2 - 0x02): Minutes 1s (changes once every 60 sec)
-        if (d2 != lastDisplayedDigits[2]) {
-          lastDisplayedDigits[2] = d2;
-          setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
-        }
-
-        // Drum 3 (Slave 1 - 0x01): Seconds 10s (changes once every 10 sec)
-        if (d3 != lastDisplayedDigits[3]) {
-          lastDisplayedDigits[3] = d3;
-          setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
-        }
-
-        // Drum 4 (Master): Seconds 1s (changes EVERY second!)
-        if (d4 != lastDisplayedDigits[4]) {
-          lastDisplayedDigits[4] = d4;
-          setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4));
-        }
-      }
-
-      if (currentMinutes == 0 && currentSeconds == 0) {
-        // Hold at zero alarm
-      } else {
+        // Decrement time first
         if (currentSeconds == 0) {
           currentMinutes--;
           currentSeconds = 59;
         } else {
           currentSeconds--;
+        }
+
+        int d0 = (currentMinutes / 100) % 10; // Minutes 100s
+        int d1 = (currentMinutes / 10) % 10;  // Minutes 10s
+        int d2 = currentMinutes % 10;         // Minutes 1s
+        int d3 = (currentSeconds / 10) % 10;  // Seconds 10s
+        int d4 = currentSeconds % 10;         // Seconds 1s
+
+        // Only command drums when their displayed digit actually changes!
+        if (d0 != lastDisplayedDigits[0]) {
+          lastDisplayedDigits[0] = d0;
+          setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
+        }
+
+        if (d1 != lastDisplayedDigits[1]) {
+          lastDisplayedDigits[1] = d1;
+          setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
+        }
+
+        if (d2 != lastDisplayedDigits[2]) {
+          lastDisplayedDigits[2] = d2;
+          setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
+        }
+
+        if (d3 != lastDisplayedDigits[3]) {
+          lastDisplayedDigits[3] = d3;
+          setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
+        }
+
+        if (d4 != lastDisplayedDigits[4]) {
+          lastDisplayedDigits[4] = d4;
+          setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4));
         }
       }
     }
