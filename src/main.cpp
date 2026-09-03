@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 // --- FIRMWARE VERSION & OTA CONFIGURATION ---
-const String CURRENT_VERSION = "1.4.37";
+const String CURRENT_VERSION = "1.4.38";
 const String VERSION_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/version.txt";
 const String FIRMWARE_URL = "https://raw.githubusercontent.com/rbd3453/swanclock/main/ota/firmware.bin";
 
@@ -221,7 +221,7 @@ bool setDrumFlap(int drumIndex, int flap, int extraRot = 0) {
 }
 
 // Wait for a drum to complete its move and power off coils (ensures only 1 motor ever active)
-void waitForDrum(int drumIndex, unsigned long timeoutMs = 1800) {
+void waitForDrum(int drumIndex, unsigned long timeoutMs = 5000) {
   if (drumIndex == 4) {
     unsigned long start = millis();
     while (stepper.distanceToGo() != 0 && (millis() - start < timeoutMs)) {
@@ -489,7 +489,7 @@ const char* mainPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SWAN STATION</h1>
-        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.37)</div>
+        <div class="subtitle">PRIMARY CLOCK TERMINAL (v1.4.38)</div>
       </div>
       <a href="/diagnostics" class="gear-btn" title="Settings, Calibration & Diagnostics">⚙️</a>
     </div>
@@ -645,7 +645,7 @@ const char* diagnosticsPageHtml = R"rawliteral(
     <div class="header-bar">
       <div class="title-box">
         <h1>SETTINGS & CALIBRATION</h1>
-        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.37)</div>
+        <div style="color: #666; font-size: 11px;">SYSTEM DIAGNOSTICS (v1.4.38)</div>
       </div>
       <a href="/" class="back-btn">← TERMINAL</a>
     </div>
@@ -1114,7 +1114,7 @@ void handleSetCustomFlaps() {
   server.send(200, "text/plain", resultLog.length() > 0 ? resultLog : "All selected drums already in position.");
 }
 
-void initiateCountdown(int mins, int secs, bool dramaticMasterRot = false) {
+void initiateCountdown(int mins, int secs) {
   currentMinutes = mins;
   currentSeconds = secs;
   isPaused = false;
@@ -1129,20 +1129,27 @@ void initiateCountdown(int mins, int secs, bool dramaticMasterRot = false) {
   Serial.printf("[SYSTEM] Aligning drums to starting time %03d:%02d...\n", mins, secs);
 
   bool ok0 = setDrumFlap(0, getNextFlapForDigit(drumFlapState[0], d0));
-  if (ok0 && powerMode == 0) waitForDrum(0); else delay(100);
+  if (ok0 && powerMode == 0) waitForDrum(0, 4000); else delay(100);
 
   bool ok1 = setDrumFlap(1, getNextFlapForDigit(drumFlapState[1], d1));
-  if (ok1 && powerMode == 0) waitForDrum(1); else delay(100);
+  if (ok1 && powerMode == 0) waitForDrum(1, 4000); else delay(100);
 
   bool ok2 = setDrumFlap(2, getNextFlapForDigit(drumFlapState[2], d2));
-  if (ok2 && powerMode == 0) waitForDrum(2); else delay(100);
+  if (ok2 && powerMode == 0) waitForDrum(2, 4000); else delay(100);
 
   bool ok3 = setDrumFlap(3, getNextFlapForDigit(drumFlapState[3], d3));
-  if (ok3 && powerMode == 0) waitForDrum(3); else delay(100);
+  if (ok3 && powerMode == 0) waitForDrum(3, 4000); else delay(100);
 
-  int extra = dramaticMasterRot ? 2 : 0;
-  bool ok4 = setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4), extra);
-  if (ok4 && powerMode == 0) waitForDrum(4);
+  // Master drum: clean, direct navigation with zero extra spins
+  setDrumFlap(4, getNextFlapForDigit(drumFlapState[4], d4), 0);
+  waitForDrum(4, 5000); // Fully wait until Master has arrived and stopped!
+
+  if (powerMode == 1) {
+    if (ok0) waitForDrum(0, 3000);
+    if (ok1) waitForDrum(1, 3000);
+    if (ok2) waitForDrum(2, 3000);
+    if (ok3) waitForDrum(3, 3000);
+  }
 
   lastDisplayedDigits[0] = d0;
   lastDisplayedDigits[1] = d1;
@@ -1150,8 +1157,10 @@ void initiateCountdown(int mins, int secs, bool dramaticMasterRot = false) {
   lastDisplayedDigits[3] = d3;
   lastDisplayedDigits[4] = d4;
 
-  holdStartTime = millis(); // Start the 5-second countdown hold
-  Serial.printf("[SYSTEM] Drums aligned to %03d:%02d. Holding for 5 seconds before countdown begins...\n", mins, secs);
+  // ALL DRUMS ARE NOW 100% IN POSITION AND MOTIONLESS.
+  // NOW AND ONLY NOW DO WE START THE 5-SECOND COUNTDOWN HOLD!
+  holdStartTime = millis();
+  Serial.printf("[SYSTEM] All drums stationary at %03d:%02d. Starting 5-second hold!\n", mins, secs);
 }
 
 void handleStartCountdown() {
@@ -1161,7 +1170,7 @@ void handleStartCountdown() {
     if (m < 0) m = 0;
     if (s < 0) s = 0;
     if (s > 59) s = 59;
-    initiateCountdown(m, s, false);
+    initiateCountdown(m, s);
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Missing min or sec parameter");
@@ -1171,7 +1180,7 @@ void handleStartCountdown() {
 void handleExecute() {
   Serial.println("\n[SYSTEM] > 4 8 15 16 23 42");
   Serial.println("[SYSTEM] > OVERRIDE ACCEPTED. RESETTING TO 108:00\n");
-  initiateCountdown(START_MINUTES, 0, true);
+  initiateCountdown(START_MINUTES, 0);
   server.send(200, "text/plain", "OK");
 }
 
